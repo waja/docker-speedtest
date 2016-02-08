@@ -1,0 +1,12 @@
+sudo: required
+dist: trusty
+language: c
+
+services:
+  - docker
+
+install:
+  - docker build -t waja/speedtest .
+
+script:
+  - test $(docker run --rm -it waja/speedtest -h | head -1 | cut -d' ' -f2) = "speedtest-cli"
