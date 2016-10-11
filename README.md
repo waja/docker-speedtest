@@ -1,4 +1,4 @@
-uilds a docker image with the [speedtest-cli](speedtest-cli) ready to run.
+Builds a docker image with the [speedtest-cli](https://github.com/sivel/speedtest-cli) ready to run.
 
 Pulled from https://github.com/tianon/dockerfiles/tree/master/speedtest
 
