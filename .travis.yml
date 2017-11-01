@@ -6,7 +6,7 @@ services:
   - docker
 
 install:
-  - docker build -t waja/speedtest .
+  - make build
 
 script:
-  - test $(docker run --rm -it waja/speedtest -h | head -1 | cut -d' ' -f2) = "speedtest-cli"
+  - make test
