@@ -1,3 +1,12 @@
+# Docker-Speedtest
+
+[![Build Status](https://travis-ci.org/Cyconet/docker-speedtest.svg?branch=development)](https://travis-ci.org/Cyconet/docker-speedtest)
+[![Docker Build Status](https://img.shields.io/docker/build/waja/speedtest.svg)](https://hub.docker.com/r/waja/speedtest/)
+[![GitHub tag](https://img.shields.io/github/tag/Cyconet/docker-speedtest.svg)](https://github.com/Cyconet/docker-speedtest/tags)
+[![](https://img.shields.io/docker/pulls/waja/speedtest.svg)](https://hub.docker.com/r/waja/speedtest/)
+[![](https://img.shields.io/docker/stars/waja/speedtest.svg)](https://hub.docker.com/r/waja/speedtest/)
+[![](https://img.shields.io/docker/automated/waja/speedtest.svg)](https://hub.docker.com/r/waja/speedtest/)
+
 Builds a docker image with the [speedtest-cli](https://github.com/sivel/speedtest-cli) ready to run.
 
 Pulled from https://github.com/tianon/dockerfiles/tree/master/speedtest
