@@ -5,7 +5,8 @@ MAINTAINER Jan Wagner "waja@cyconet.org"
 
 ENV SPEEDTEST_CLI_VERSION 2.0.0
 
-RUN apk --no-cache add python py-pip && \
+RUN apk --no-cache update && apk --no-cache upgrade && \
+ apk --no-cache add python py-pip && \
  apk --no-cache add --virtual build-dependencies python-dev build-base wget && \
  pip install speedtest-cli==$SPEEDTEST_CLI_VERSION && \
  apk del build-dependencies
