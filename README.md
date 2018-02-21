@@ -1,7 +1,7 @@
 # Docker-Speedtest
 
-[![](https://images.microbadger.com/badges/version/waja/project.svg)](https://hub.docker.com/r/waja/project/)
-[![](https://images.microbadger.com/badges/image/waja/project.svg)](https://hub.docker.com/r/waja/project/)
+[![](https://images.microbadger.com/badges/version/waja/speedtest.svg)](https://hub.docker.com/r/waja/speedtest/)
+[![](https://images.microbadger.com/badges/image/waja/speedtest.svg)](https://hub.docker.com/r/waja/speedtest/)
 [![Build Status](https://travis-ci.org/Cyconet/docker-speedtest.svg?branch=development)](https://travis-ci.org/Cyconet/docker-speedtest)
 [![Docker Build Status](https://img.shields.io/docker/build/waja/speedtest.svg)](https://hub.docker.com/r/waja/speedtest/)
 [![GitHub tag](https://img.shields.io/github/tag/Cyconet/docker-speedtest.svg)](https://github.com/Cyconet/docker-speedtest/tags)
