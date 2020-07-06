@@ -23,8 +23,8 @@ LABEL org.label-schema.name="speedtest-cli - command line interface for testing 
 ENV SPEEDTEST_CLI_VERSION 2.1.2
 
 RUN apk --no-cache update && apk --no-cache upgrade && \
- apk --no-cache add python py-pip && \
- apk --no-cache add --virtual build-dependencies python-dev build-base wget && \
+ apk --no-cache add python3 py-pip && \
+ apk --no-cache add --virtual build-dependencies python3-dev build-base wget && \
  pip install speedtest-cli==$SPEEDTEST_CLI_VERSION && \
  apk del build-dependencies
 
