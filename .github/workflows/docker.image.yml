@@ -1,0 +1,37 @@
+name: Docker Image CI
+
+on:
+  push:
+    branches: 
+      - $default-branch
+      - development
+      - master
+  # Run tests for any PRs
+  pull_request:
+
+env:
+  IMAGE_NAME: speedtest
+
+jobs:
+  lint-docker-file:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v2
+    - name: lint zammad dockerfile
+      uses: brpaz/hadolint-action@master
+      with:
+        dockerfile: Dockerfile
+  build:
+    needs:
+      - lint-docker-file
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    - name: Build the Docker image
+      run:  docker build . --file Dockerfile --build-arg BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')" --tag ${IMAGE_NAME}
+    - name: Test the Docker image
+      run: |
+        CONTAINER_OUTPUT=$(docker run --rm -t ${IMAGE_NAME} -h)
+        TEST_STRING=$(echo ${CONTAINER_OUTPUT} | head -1 | cut -d' ' -f2 | tr -d '\r')
+        if ! [ "${TEST_STRING}" = "speedtest-cli" ]; then exit 1; fi
