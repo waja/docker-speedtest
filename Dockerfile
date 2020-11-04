@@ -19,6 +19,7 @@ LABEL org.label-schema.name="speedtest-cli - command line interface for testing 
 
 ENV SPEEDTEST_CLI_VERSION 2.1.2
 
+# hadolint ignore=DL3017,DL3018
 RUN apk --no-cache update && apk --no-cache upgrade && \
  apk --no-cache add python3 py-pip && \
  apk --no-cache add --virtual build-dependencies python3-dev build-base wget && \
