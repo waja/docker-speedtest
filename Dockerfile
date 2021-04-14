@@ -17,7 +17,7 @@ LABEL org.label-schema.name="speedtest-cli - command line interface for testing 
     org.label-schema.vcs-ref="${VCS_REF:-unknown}" \
     org.label-schema.vcs-branch="${VCS_BRANCH:-unknown}"
 
-ENV SPEEDTEST_CLI_VERSION 2.1.2
+ENV SPEEDTEST_CLI_VERSION 2.1.3
 
 # hadolint ignore=DL3017,DL3018
 RUN apk --no-cache update && apk --no-cache upgrade && \
