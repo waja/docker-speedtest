@@ -15,7 +15,8 @@ LABEL org.label-schema.name="speedtest-cli - command line interface for testing 
     org.label-schema.version="${BUILD_VERSION:-unknown}" \
     org.label-schema.vcs-url="${VCS_URL:-unknown}" \
     org.label-schema.vcs-ref="${VCS_REF:-unknown}" \
-    org.label-schema.vcs-branch="${VCS_BRANCH:-unknown}"
+    org.label-schema.vcs-branch="${VCS_BRANCH:-unknown}" \
+    org.opencontainers.image.source="https://github.com/waja/docker-speedtest"
 
 ENV SPEEDTEST_CLI_VERSION 2.1.3
 
