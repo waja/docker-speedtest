@@ -37,3 +37,10 @@ jobs:
         CONTAINER_OUTPUT=$(docker run --rm -t ${IMAGE_NAME} -h)
         TEST_STRING=$(echo ${CONTAINER_OUTPUT} | head -1 | cut -d' ' -f2 | tr -d '\r')
         if ! [ "${TEST_STRING}" = "speedtest-cli" ]; then exit 1; fi
+    - name: Scan image
+      uses: Azure/container-scan@v0
+      env:
+        DOCKER_CONTENT_TRUST: 1
+      with:
+        image-name: ${{ env.IMAGE_NAME }}
+        severity-threshold: HIGH
