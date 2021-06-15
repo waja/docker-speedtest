@@ -12,7 +12,7 @@
 
 Builds a docker image with the [speedtest-cli](https://github.com/sivel/speedtest-cli) ready to run.
 
-Pulled from https://github.com/tianon/dockerfiles/tree/master/speedtest
+Pulled from [https://github.com/tianon/dockerfiles/tree/master/speedtest](https://github.com/tianon/dockerfiles/tree/master/speedtest)
 
 Ever wanted to speedtest a server, but didn't want to do funky tunnelling so you could hit up good ol' speedtest.net?  WORRY NO MORE.
 
