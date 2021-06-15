@@ -7,7 +7,8 @@ ARG VCS_REF
 ARG VCS_BRANCH
 
 # See http://label-schema.org/rc1/ and https://microbadger.com/labels
-LABEL org.label-schema.name="speedtest-cli - command line interface for testing internet bandwidth using speedtest.net" \
+LABEL maintainer="Jan Wagner <waja@cyconet.org>" \
+    org.label-schema.name="speedtest-cli - command line interface for testing internet bandwidth using speedtest.net" \
     org.label-schema.description="Command line interface for testing internet bandwidth on Alpine Linux based container" \
     org.label-schema.vendor="Cyconet" \
     org.label-schema.schema-version="1.0" \
