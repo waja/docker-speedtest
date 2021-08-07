@@ -123,7 +123,7 @@ jobs:
           acs-report-enable: true
           severity-cutoff: critical
       - name: Move reports
-        run: mkdir -p sarif-reports && cp *results.sarif sarif-reports/
+        run: mkdir -p sarif-reports && cp ./*results.sarif ./sarif-reports/
       - name: Upload Reports
         uses: github/codeql-action/upload-sarif@v1
         with:
