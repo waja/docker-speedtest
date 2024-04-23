@@ -1,8 +1,7 @@
 #!/bin/sh
 set -e
 
-# shellcheck disable=SC3057
-if [ "${1:0:1}" = '-' ]; then
+if [ "$(printf '%s' "$1" | cut -c 1)" = '-' ]; then
 	set -- speedtest-cli "$@"
 fi
 
