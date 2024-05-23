@@ -7,7 +7,7 @@ ARG BUILD_VERSION
 ARG VCS_URL
 ARG VCS_REF
 ARG VCS_BRANCH
-ARG SPEEDTEST_CLI_PACKAGE_VERSION=2.1.3-r6
+ARG SPEEDTEST_CLI_PACKAGE_VERSION=2.1.3-r7
 
 # See http://label-schema.org/rc1/ and https://microbadger.com/labels
 LABEL maintainer="Jan Wagner <waja@cyconet.org>" \
