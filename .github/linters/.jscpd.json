@@ -1,6 +1,4 @@
 {
   "threshold": 4,
-  "ignore": [
-    "**/.github/workflows/docker.image.yml"
-  ]
+  "ignore": ["**/.github/workflows/docker.image.yml"]
 }
