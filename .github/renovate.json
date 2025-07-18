@@ -5,6 +5,35 @@
     {
       "matchFileNames": [".github/workflows/**"],
       "pinDigests": false
+    },
+    {
+      "description": "Automerge non-major updates",
+      "matchManagers": ["dockerfile"],
+      "matchUpdateTypes": ["patch"],
+      "matchCurrentVersion": "!/^0/",
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Automerge digest updates",
+      "matchManagers": ["dockerfile"],
+      "matchUpdateTypes": ["digest"],
+      "automerge": true,
+      "automergeType": "pr"
+    },
+    {
+      "description": "Automerge some GitHub Actions (Lint/Prettier/Scanner)",
+      "matchFileNames": [".github/workflows/**"],
+      "matchManagers": ["github-actions"],
+      "automerge": true,
+      "automergeType": "pr",
+      "matchPackageNames": [
+        "/.*codespell.*/",
+        "/.*lint.*/",
+        "/.*dockle.*/",
+        "/.*trivy.*/",
+        "/.*anchore.*/"
+      ]
     }
   ]
 }
