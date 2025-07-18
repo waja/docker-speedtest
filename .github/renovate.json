@@ -27,12 +27,12 @@
       "matchManagers": ["github-actions"],
       "automerge": true,
       "automergeType": "pr",
-      "matchPackagePatterns": [
-        ".*codespell.*",
-        ".*lint.*",
-        ".*dockle.*",
-        ".*trivy.*",
-        ".*anchore.*"
+      "matchPackageNames": [
+        "/.*codespell.*/",
+        "/.*lint.*/",
+        "/.*dockle.*/",
+        "/.*trivy.*/",
+        "/.*anchore.*/"
       ]
     }
   ]
