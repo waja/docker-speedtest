@@ -94,7 +94,7 @@ jobs:
             VCS_URL="$(git config --get remote.origin.url)"
             VCS_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.IMAGE_NAME }}-${{ github.run_number }}
           path: /tmp/${{ env.IMAGE_NAME }}-${{ github.run_number }}.tar
@@ -112,7 +112,7 @@ jobs:
           - 5000:5000
     steps:
       - name: Download artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: ${{ env.IMAGE_NAME }}-${{ github.run_number }}
           path: /tmp
@@ -144,7 +144,7 @@ jobs:
           - 5000:5000
     steps:
       - name: Download artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: ${{ env.IMAGE_NAME }}-${{ github.run_number }}
           path: /tmp
@@ -181,7 +181,7 @@ jobs:
           - 5000:5000
     steps:
       - name: Download artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: ${{ env.IMAGE_NAME }}-${{ github.run_number }}
           path: /tmp
@@ -216,7 +216,7 @@ jobs:
           - 5000:5000
     steps:
       - name: Download artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: ${{ env.IMAGE_NAME }}-${{ github.run_number }}
           path: /tmp
@@ -313,7 +313,7 @@ jobs:
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
       - name: Download artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: ${{ env.IMAGE_NAME }}-${{ github.run_number }}
           path: /tmp
