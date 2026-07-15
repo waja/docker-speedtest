@@ -126,7 +126,7 @@ jobs:
           docker buildx imagetools inspect localhost:5000/foobar/${{ env.IMAGE_NAME }}
       - name: Test the Docker image
         run: |
-          CONTAINER_OUTPUT=$(docker run --rm -t localhost:5000/foobar/${{ env.IMAGE_NAME }} -h)
+          CONTAINER_OUTPUT=$(docker run --rm localhost:5000/foobar/${{ env.IMAGE_NAME }} -h)
           echo "Container output: $CONTAINER_OUTPUT"
           echo "Container output (quoted): '$CONTAINER_OUTPUT'"
 
