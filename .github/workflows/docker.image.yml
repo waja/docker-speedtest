@@ -130,8 +130,7 @@ jobs:
           echo "Container output: $CONTAINER_OUTPUT"
           echo "Container output (quoted): '$CONTAINER_OUTPUT'"
 
-          # shellcheck disable=SC2086
-          TEST_STRING=$(echo ${CONTAINER_OUTPUT} | head -1 | cut -d' ' -f2 | tr -d '\r')
+          TEST_STRING=$(echo "${CONTAINER_OUTPUT}" | head -1 | cut -d' ' -f2 | tr -d '\r')
           echo "Extracted test string: '$TEST_STRING'"
 
           if ! [ "${TEST_STRING}" = "speedtest-cli" ]; then
