@@ -127,9 +127,16 @@ jobs:
       - name: Test the Docker image
         run: |
           CONTAINER_OUTPUT=$(docker run --rm -t localhost:5000/foobar/${{ env.IMAGE_NAME }} -h)
-          # shellcheck disable=SC2086
-          TEST_STRING=$(echo ${CONTAINER_OUTPUT} | head -1 | cut -d' ' -f2 | tr -d '\r')
-          if ! [ "${TEST_STRING}" = "speedtest-cli" ]; then exit 1; fi
+          echo "Container output: $CONTAINER_OUTPUT"
+          echo "Container output (quoted): '$CONTAINER_OUTPUT'"
+
+          TEST_STRING=$(echo "${CONTAINER_OUTPUT}" | head -1 | cut -d' ' -f2 | tr -d '\r')
+          echo "Extracted test string: '$TEST_STRING'"
+
+          if ! [ "${TEST_STRING}" = "speedtest-cli" ]; then
+            echo "ERROR: Expected 'speedtest-cli' but got '$TEST_STRING'"
+            exit 1
+          fi
   dockle:
     name: Run Dockle tests
     needs:
