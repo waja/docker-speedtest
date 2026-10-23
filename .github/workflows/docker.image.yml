@@ -41,7 +41,9 @@ on:
 
 # Prevent two runs for the same branch or tag from publishing concurrently.
 concurrency:
-  group: docker-image-${{ inputs.image_version || github.ref_name }}
+  group: >-
+    docker-image-${{ inputs.publish == false && inputs.test_id ||
+      inputs.image_version || github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -308,6 +310,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_REF_INPUT: ${{ inputs.source_ref }}
           IMAGE_VERSION_INPUT: ${{ inputs.image_version }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
           QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
         run: |
@@ -369,7 +372,8 @@ jobs:
 
           # Workflow-level concurrency serializes runs for this ref. A second
           # run must also avoid publishing if an earlier run already succeeded.
-          if [[ "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$ ]]; then
+          if [[ "$PUBLISH_INPUT" != "false" && \
+                "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$ ]]; then
             source_sha="${SOURCE_REF_INPUT:-$GITHUB_SHA}"
             publish_title="Docker Image CI release-publish-$VERSION-$source_sha"
             run_lines=$(gh api --paginate --method GET \
