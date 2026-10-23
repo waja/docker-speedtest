@@ -279,6 +279,7 @@ jobs:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
         run: |
@@ -331,6 +332,30 @@ jobs:
             fi
           fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "skip_publish=false" >> "$GITHUB_OUTPUT"
+
+          # Workflow-level concurrency serializes runs for this ref. A second
+          # run must also avoid publishing if an earlier run already succeeded.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            run_lines=$(gh api --paginate --method GET \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/docker.image.yml/runs" \
+              -f branch="$VERSION" -F per_page=100 \
+              --jq '.workflow_runs[] | {id,event,head_sha,head_branch,conclusion}')
+            successful=$(jq -s --arg sha "$GITHUB_SHA" \
+              --arg branch "$VERSION" --argjson current "$GITHUB_RUN_ID" '
+                [.[] | select(
+                  .id != $current
+                  and .head_sha == $sha
+                  and .head_branch == $branch
+                  and (.event == "push" or .event == "workflow_dispatch")
+                  and .conclusion == "success"
+                )] | length
+              ' <<< "$run_lines")
+            if [[ "$successful" -gt 0 ]]; then
+              echo "A successful image run already exists for $VERSION at $GITHUB_SHA."
+              echo "skip_publish=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
 
       - name: Download artifact
         uses: actions/download-artifact@v8
@@ -406,6 +431,7 @@ jobs:
             VCS_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 
       - name: Build and push
+        if: steps.prep.outputs.skip_publish != 'true'
         id: docker_build
         uses: docker/build-push-action@v7
         with:
