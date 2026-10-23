@@ -266,18 +266,48 @@ jobs:
           fi
 
           err=$(mktemp)
+          merge_method=merge
           if result=$(gh api --method PUT "$API/pulls/$PR_NUMBER/merge" \
-            -f "sha=$EXPECTED_HEAD" -f "merge_method=merge" 2>"$err"); then
+            -f "sha=$EXPECTED_HEAD" -f "merge_method=$merge_method" 2>"$err"); then
             if [[ $(jq -r '.merged' <<< "$result") != "true" ]]; then
               echo "::error::GitHub did not merge PR #$PR_NUMBER."
               jq -r '.message // "No merge details returned."' <<< "$result"
               exit 1
             fi
           else
-            cat "$err"
-            echo "::error::The merge was rejected by GitHub or branch rules."
-            echo "If master requires human approval, approve the PR and retry this workflow."
-            exit 1
+            # Linear-history rules can forbid merge commits even if the repo
+            # allows them globally. Fall back only for that specific failure.
+            if grep -Eqi 'linear history|merge method.*not allowed|merge commits.*not allowed' "$err"; then
+              repo_settings=$(gh api "$API")
+              if [[ $(jq -r '.allow_squash_merge' <<< "$repo_settings") == "true" ]]; then
+                merge_method=squash
+              elif [[ $(jq -r '.allow_rebase_merge' <<< "$repo_settings") == "true" ]]; then
+                merge_method=rebase
+              else
+                cat "$err"
+                echo "::error::No merge method compatible with repository settings is enabled."
+                exit 1
+              fi
+              echo "Retrying merge using $merge_method, as required by repository merge rules."
+              if result=$(gh api --method PUT "$API/pulls/$PR_NUMBER/merge" \
+                -f "sha=$EXPECTED_HEAD" -f "merge_method=$merge_method" 2>"$err"); then
+                if [[ $(jq -r '.merged' <<< "$result") != "true" ]]; then
+                  echo "::error::GitHub did not merge PR #$PR_NUMBER."
+                  jq -r '.message // "No merge details returned."' <<< "$result"
+                  exit 1
+                fi
+              else
+                cat "$err"
+                echo "::error::The merge is blocked by branch rules or required approval."
+                echo "Resolve the policy requirement, then retry this release."
+                exit 1
+              fi
+            else
+              cat "$err"
+              echo "::error::The merge is blocked by branch rules or required approval."
+              echo "If master requires human approval, approve the PR and retry this workflow."
+              exit 1
+            fi
           fi
 
           merge_sha=$(jq -r '.sha' <<< "$result")
@@ -307,8 +337,7 @@ jobs:
           fi
           echo "sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Refuse a tag whose image history points to another commit
-        if: steps.validate.outputs.mode == 'tagged'
+      - name: Refuse tag reuse when image history points to another commit
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
@@ -327,13 +356,9 @@ jobs:
           ' <<< "$runs")
           if [[ -n "$latest" ]]; then
             latest_sha=$(jq -r '.head_sha' <<< "$latest")
-            latest_status=$(jq -r '.status' <<< "$latest")
-            latest_conclusion=$(jq -r '.conclusion // empty' <<< "$latest")
-            if [[ "$latest_sha" != "$RELEASE_SHA" && \
-                  ( "$latest_status" != "completed" || \
-                    "$latest_conclusion" == "success" ) ]]; then
+            if [[ "$latest_sha" != "$RELEASE_SHA" ]]; then
               echo "::error::The latest Docker CI run for this tag uses another commit."
-              echo "Refusing to overwrite a running or successfully published image."
+              echo "Refusing to change the image associated with this tag."
               jq '{id,head_sha,status,conclusion}' <<< "$latest"
               exit 1
             fi
@@ -541,11 +566,7 @@ jobs:
           ' <<< "$run_lines")
           if [[ -n "$latest" ]]; then
             latest_sha=$(jq -r '.head_sha' <<< "$latest")
-            latest_status=$(jq -r '.status' <<< "$latest")
-            latest_conclusion=$(jq -r '.conclusion // empty' <<< "$latest")
-            if [[ "$latest_sha" != "$RELEASE_SHA" && \
-                  ( "$latest_status" != "completed" || \
-                    "$latest_conclusion" == "success" ) ]]; then
+            if [[ "$latest_sha" != "$RELEASE_SHA" ]]; then
               echo "::error::The latest Docker CI run for this tag uses another commit."
               echo "Refusing to overwrite an image published from a different SHA."
               jq '{id,head_sha,status,conclusion}' <<< "$latest"
