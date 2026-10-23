@@ -73,6 +73,12 @@ jobs:
           VALIDATE_BIOME_FORMAT: false
   shiftleft:
     name: shiftleft
+    outputs:
+      build_date: ${{ steps.metadata.outputs.build_date }}
+      build_version: ${{ steps.metadata.outputs.build_version }}
+      vcs_ref: ${{ steps.metadata.outputs.vcs_ref }}
+      vcs_url: ${{ steps.metadata.outputs.vcs_url }}
+      vcs_branch: ${{ steps.metadata.outputs.vcs_branch }}
     strategy:
       fail-fast: false
     runs-on: ubuntu-latest
@@ -81,6 +87,21 @@ jobs:
         with:
           ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 0
+
+      - name: Prepare image metadata
+        id: metadata
+        env:
+          BUILD_VERSION_INPUT: ${{ inputs.image_version }}
+          VCS_BRANCH_INPUT: ${{ inputs.image_version || github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          {
+            echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
+            echo "vcs_ref=$(git rev-parse --short HEAD)"
+            echo "vcs_url=$(git config --get remote.origin.url)"
+            echo "vcs_branch=$VCS_BRANCH_INPUT"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Perform ShiftLeft Scan
         uses: ShiftLeftSecurity/scan-action@v1.3.0
@@ -110,21 +131,6 @@ jobs:
           ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 0
 
-      - name: Prepare image metadata
-        id: metadata
-        env:
-          BUILD_VERSION_INPUT: ${{ inputs.image_version }}
-          VCS_BRANCH_INPUT: ${{ inputs.image_version || github.head_ref || github.ref_name }}
-        run: |
-          set -euo pipefail
-          {
-            echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
-            echo "vcs_ref=$(git rev-parse --short HEAD)"
-            echo "vcs_url=$(git config --get remote.origin.url)"
-            echo "vcs_branch=$VCS_BRANCH_INPUT"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v4
@@ -144,11 +150,11 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           build-args: |
-            BUILD_DATE=${{ steps.metadata.outputs.build_date }}
-            BUILD_VERSION=${{ steps.metadata.outputs.build_version }}
-            VCS_REF=${{ steps.metadata.outputs.vcs_ref }}
-            VCS_URL=${{ steps.metadata.outputs.vcs_url }}
-            VCS_BRANCH=${{ steps.metadata.outputs.vcs_branch }}
+            BUILD_DATE=${{ needs.shiftleft.outputs.build_date }}
+            BUILD_VERSION=${{ needs.shiftleft.outputs.build_version }}
+            VCS_REF=${{ needs.shiftleft.outputs.vcs_ref }}
+            VCS_URL=${{ needs.shiftleft.outputs.vcs_url }}
+            VCS_BRANCH=${{ needs.shiftleft.outputs.vcs_branch }}
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
