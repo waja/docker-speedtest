@@ -119,10 +119,14 @@ jobs:
               exit 1
             fi
 
-            merged_prs=$(gh pr list --repo "$REPOSITORY" --state merged \
-              --base master --head development --limit 100 \
-              --json number,title,mergedAt,mergeCommit,url)
-            merged_pr=$(jq -c --arg title "Release: $RELEASE_TAG" '
+            owner=$(gh api "$API" --jq '.owner.login')
+            merged_prs=$(gh api --paginate --method GET "$API/pulls" \
+              -f state=closed -f base=master \
+              -f "head=$owner:development" -F per_page=100 \
+              --jq '.[] | select(.merged_at != null) |
+                {number,title,mergedAt:.merged_at,
+                 mergeCommit:{oid:.merge_commit_sha},url:.html_url}')
+            merged_pr=$(jq -s -c --arg title "Release: $RELEASE_TAG" '
               [.[] | select(.title == $title)]
               | sort_by(.mergedAt)
               | last // empty
