@@ -1,7 +1,9 @@
 ---
 name: Docker Image CI
 
-# checkov:skip=CKV_GHA_7: The release workflow needs publish=false test dispatches.
+run-name: Docker Image CI ${{ inputs.test_id || inputs.image_version || github.ref_name }}
+
+# checkov:skip=CKV_GHA_7: The release workflow needs test-only workflow inputs.
 on:
   workflow_dispatch:
     inputs:
@@ -10,6 +12,21 @@ on:
         required: false
         type: boolean
         default: true
+      source_ref:
+        description: "Commit or ref to check out for release validation"
+        required: false
+        type: string
+        default: ""
+      test_id:
+        description: "Optional unique run name used by release automation"
+        required: false
+        type: string
+        default: ""
+      image_version:
+        description: "Override the image version for release automation"
+        required: false
+        type: string
+        default: ""
   push:
     branches:
       - $default-branch
@@ -24,7 +41,7 @@ on:
 
 # Prevent two runs for the same branch or tag from publishing concurrently.
 concurrency:
-  group: docker-image-${{ github.ref }}
+  group: docker-image-${{ inputs.image_version || github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -40,8 +57,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
+        with:
           # super-linter needs the full git history to get the
           # list of files that changed across commits
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 0
       - name: Lint Code Base
         uses: super-linter/super-linter@v9.0.0
@@ -58,6 +78,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
       - name: Perform ShiftLeft Scan
         uses: ShiftLeftSecurity/scan-action@v1.3.0
         env:
@@ -82,6 +104,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v4
@@ -105,7 +129,7 @@ jobs:
             BUILD_VERSION="$(git describe --tags)"
             VCS_REF="$(git rev-parse --short HEAD)"
             VCS_URL="$(git config --get remote.origin.url)"
-            VCS_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+            VCS_BRANCH="${IMAGE_VERSION_INPUT:-$(git rev-parse --abbrev-ref HEAD)}"
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -272,6 +296,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
 
       - name: Prepare
         id: prep
@@ -280,6 +306,8 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+          IMAGE_VERSION_INPUT: ${{ inputs.image_version }}
           QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
         run: |
@@ -303,6 +331,11 @@ jobs:
           # running on master branch
           if [ "$VERSION" = "master" ]; then
             VERSION=latest
+          fi
+          # Release automation can run the workflow from the default branch
+          # while explicitly checking out the tested merge commit.
+          if [[ -n "$IMAGE_VERSION_INPUT" ]]; then
+            VERSION="$IMAGE_VERSION_INPUT"
           fi
           TAGS="${DOCKER_IMAGE}:${VERSION}"
           if [[ "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\-[0-9]{1,3}$ ]]; then
@@ -336,23 +369,27 @@ jobs:
 
           # Workflow-level concurrency serializes runs for this ref. A second
           # run must also avoid publishing if an earlier run already succeeded.
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          if [[ "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$ ]]; then
+            source_sha="${SOURCE_REF_INPUT:-$GITHUB_SHA}"
+            publish_title="Docker Image CI release-publish-$VERSION-$source_sha"
             run_lines=$(gh api --paginate --method GET \
               "repos/$GITHUB_REPOSITORY/actions/workflows/docker.image.yml/runs" \
-              -f branch="$VERSION" -F per_page=100 \
-              --jq '.workflow_runs[] | {id,event,head_sha,head_branch,conclusion}')
-            successful=$(jq -s --arg sha "$GITHUB_SHA" \
-              --arg branch "$VERSION" --argjson current "$GITHUB_RUN_ID" '
+              -F per_page=100 \
+              --jq '.workflow_runs[] | {id,event,head_sha,head_branch,display_title,conclusion}')
+            successful=$(jq -s --arg sha "$source_sha" --arg tag "$VERSION" \
+              --arg title "$publish_title" --argjson current "$GITHUB_RUN_ID" '
                 [.[] | select(
                   .id != $current
-                  and .head_sha == $sha
-                  and .head_branch == $branch
-                  and (.event == "push" or .event == "workflow_dispatch")
                   and .conclusion == "success"
+                  and (
+                    ((.head_branch == $tag) and (.head_sha == $sha)
+                      and (.event == "push" or .event == "workflow_dispatch"))
+                    or .display_title == $title
+                  )
                 )] | length
               ' <<< "$run_lines")
             if [[ "$successful" -gt 0 ]]; then
-              echo "A successful image run already exists for $VERSION at $GITHUB_SHA."
+              echo "A successful image run already exists for $VERSION at $source_sha."
               echo "skip_publish=true" >> "$GITHUB_OUTPUT"
             fi
           fi
@@ -428,7 +465,7 @@ jobs:
             BUILD_VERSION="$(git describe --tags)"
             VCS_REF="$(git rev-parse --short HEAD)"
             VCS_URL="$(git config --get remote.origin.url)"
-            VCS_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+            VCS_BRANCH="${IMAGE_VERSION_INPUT:-$(git rev-parse --abbrev-ref HEAD)}"
 
       - name: Build and push
         if: steps.prep.outputs.skip_publish != 'true'
@@ -449,7 +486,7 @@ jobs:
             BUILD_VERSION="$(git describe --tags)"
             VCS_REF="$(git rev-parse --short HEAD)"
             VCS_URL="$(git config --get remote.origin.url)"
-            VCS_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+            VCS_BRANCH="${IMAGE_VERSION_INPUT:-$(git rev-parse --abbrev-ref HEAD)}"
 
       - name: Image digest
         run: echo ${{ steps.docker_build.outputs.digest }}
