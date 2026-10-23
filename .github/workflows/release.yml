@@ -42,7 +42,8 @@ jobs:
             exit 1
           fi
 
-          if tag_ref=$(gh api "$API/git/ref/tags/$RELEASE_TAG" 2>/dev/null); then
+          if tag_ref=$(gh api "$API/git/ref/tags/$RELEASE_TAG" \
+            2>/dev/null); then
             # Allow recovery only when the tag is in master history.
             release_sha=$(jq -r '.object.sha' <<< "$tag_ref")
             comparison=$(gh api "$API/compare/$release_sha...master")
@@ -252,13 +253,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
-          MERGE_SHA: ${{ steps.merge.outputs.sha || steps.validate.outputs.release_sha }}
+          MERGE_SHA: >-
+            ${{ steps.merge.outputs.sha ||
+                steps.validate.outputs.release_sha }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
 
           # Reuse a running or successful image workflow for this tag.
-          runs=$(gh api --method GET "$API/actions/workflows/docker.image.yml/runs" \
+          runs=$(gh api --method GET \
+            "$API/actions/workflows/docker.image.yml/runs" \
             -f event=workflow_dispatch -F per_page=100)
           existing=$(jq -c --arg sha "$MERGE_SHA" --arg tag "$RELEASE_TAG" '
             [.workflow_runs[]
@@ -271,7 +275,8 @@ jobs:
             status=$(jq -r '.status' <<< "$existing")
             conclusion=$(jq -r '.conclusion // empty' <<< "$existing")
             run_id=$(jq -r '.id' <<< "$existing")
-            if [[ "$status" != "completed" || "$conclusion" == "success" ]]; then
+            if [[ "$status" != "completed" || \
+                  "$conclusion" == "success" ]]; then
               echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
               echo "Reusing Docker Image CI run $run_id ($status)."
               exit 0
