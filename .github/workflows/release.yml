@@ -399,7 +399,6 @@ jobs:
               | sort_by(.created_at) | last // empty
             ' <<< "$run_lines")
           if [[ -n "$latest" ]]; then
-            latest_title=$(jq -r '.display_title // ""' <<< "$latest")
             latest_sha=$(jq -r --arg prefix "$publish_prefix" '
               if ((.display_title // "") | startswith($prefix))
               then .display_title[($prefix | length):]
@@ -587,7 +586,6 @@ jobs:
               | sort_by(.created_at) | last // empty
             ' <<< "$run_lines")
           if [[ -n "$latest" ]]; then
-            latest_title=$(jq -r '.display_title // ""' <<< "$latest")
             latest_sha=$(jq -r --arg prefix "$publish_prefix" '
               if ((.display_title // "") | startswith($prefix))
               then .display_title[($prefix | length):]
