@@ -82,21 +82,6 @@ jobs:
           ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 0
 
-      - name: Prepare image metadata
-        id: metadata
-        env:
-          BUILD_VERSION_INPUT: ${{ inputs.image_version }}
-          VCS_BRANCH_INPUT: ${{ inputs.image_version || github.head_ref || github.ref_name }}
-        run: |
-          set -euo pipefail
-          {
-            echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
-            echo "vcs_ref=$(git rev-parse --short HEAD)"
-            echo "vcs_url=$(git config --get remote.origin.url)"
-            echo "vcs_branch=$VCS_BRANCH_INPUT"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Perform ShiftLeft Scan
         uses: ShiftLeftSecurity/scan-action@v1.3.0
         env:
@@ -124,6 +109,22 @@ jobs:
         with:
           ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 0
+
+      - name: Prepare image metadata
+        id: metadata
+        env:
+          BUILD_VERSION_INPUT: ${{ inputs.image_version }}
+          VCS_BRANCH_INPUT: ${{ inputs.image_version || github.head_ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          {
+            echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
+            echo "vcs_ref=$(git rev-parse --short HEAD)"
+            echo "vcs_url=$(git config --get remote.origin.url)"
+            echo "vcs_branch=$VCS_BRANCH_INPUT"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v4
