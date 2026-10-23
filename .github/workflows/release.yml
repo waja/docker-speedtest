@@ -15,12 +15,6 @@ permissions:
   contents: write
   pull-requests: write
 
-# Different tags must not replace one another in GitHub's pending slot.
-# The first job below serializes distinct releases in run-number order.
-concurrency:
-  group: release-${{ inputs.tag }}
-  cancel-in-progress: false
-
 jobs:
   release:
     name: Merge, test and publish release
@@ -346,26 +340,41 @@ jobs:
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
-          runs=$(gh api --paginate --method GET \
+          publish_prefix="Docker Image CI release-publish-$RELEASE_TAG-"
+
+          # Detect both legacy tag-ref runs and newer default-branch runs
+          # whose run-name contains the release commit SHA.
+          run_lines=$(gh api --paginate --method GET \
             "$API/actions/workflows/docker.image.yml/runs" \
-            -f branch="$RELEASE_TAG" -F per_page=100 \
-            --jq '.workflow_runs[] | {id,event,head_sha,status,conclusion,created_at}')
-          latest=$(jq -s -c '
-            [.[] | select(.event == "push" or .event == "workflow_dispatch")]
-            | sort_by(.created_at) | last // empty
-          ' <<< "$runs")
+            -F per_page=100 \
+            --jq '.workflow_runs[] | {id,event,head_sha,head_branch,display_title,status,conclusion,created_at}')
+          latest=$(jq -s -c --arg tag "$RELEASE_TAG" \
+            --arg prefix "$publish_prefix" '
+              [.[] | select(
+                ((.head_branch == $tag)
+                  and (.event == "push" or .event == "workflow_dispatch"))
+                or ((.display_title // "") | startswith($prefix))
+              )]
+              | sort_by(.created_at) | last // empty
+            ' <<< "$run_lines")
           if [[ -n "$latest" ]]; then
-            latest_sha=$(jq -r '.head_sha' <<< "$latest")
+            latest_title=$(jq -r '.display_title // ""' <<< "$latest")
+            latest_sha=$(jq -r --arg prefix "$publish_prefix" '
+              if ((.display_title // "") | startswith($prefix))
+              then .display_title[($prefix | length):]
+              else .head_sha end
+            ' <<< "$latest")
             if [[ "$latest_sha" != "$RELEASE_SHA" ]]; then
-              echo "::error::The latest Docker CI run for this tag uses another commit."
-              echo "Refusing to change the image associated with this tag."
-              jq '{id,head_sha,status,conclusion}' <<< "$latest"
+              echo "::error::The latest publication for this tag uses another commit."
+              echo "Refusing to replace an image that may already be published."
+              jq '{id,head_sha,head_branch,display_title,status,conclusion}' <<< "$latest"
               exit 1
             fi
+            echo "Latest publication record matches the target commit."
           fi
 
-      - name: Create or reuse temporary test branch
-        id: test_branch
+      - name: Start or reuse tests for the resulting merge commit
+        id: test_dispatch
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
@@ -374,45 +383,18 @@ jobs:
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
-          branch="release-test-$RELEASE_TAG"
-          err=$(mktemp)
-          if ref=$(gh api "$API/git/ref/heads/$branch" 2>"$err"); then
-            branch_sha=$(jq -r '.object.sha' <<< "$ref")
-            if [[ "$branch_sha" != "$RELEASE_SHA" ]]; then
-              echo "::error::Temporary test branch already points elsewhere."
-              exit 1
-            fi
-          else
-            if ! grep -Eqi 'HTTP 404|status.?404' "$err"; then
-              cat "$err"
-              echo "::error::Cannot safely inspect the temporary test branch."
-              exit 1
-            fi
-            gh api --method POST "$API/git/refs" \
-              -f "ref=refs/heads/$branch" -f "sha=$RELEASE_SHA"
-          fi
-          echo "name=$branch" >> "$GITHUB_OUTPUT"
+          DEFAULT_BRANCH=$(gh api "$API" --jq '.default_branch')
+          TEST_ID="release-test-$RELEASE_TAG-$RELEASE_SHA"
+          TEST_TITLE="Docker Image CI $TEST_ID"
 
-      - name: Start or reuse tests for the resulting merge commit
-        id: test_dispatch
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
-          TEST_BRANCH: ${{ steps.test_branch.outputs.name }}
-        run: |
-          set -euo pipefail
-          API="repos/$REPOSITORY"
           run_lines=$(gh api --paginate --method GET \
             "$API/actions/workflows/docker.image.yml/runs" \
-            -f branch="$TEST_BRANCH" -F per_page=100 \
-            --jq '.workflow_runs[] | {id,event,head_sha,head_branch,status,conclusion,created_at}')
-          existing=$(jq -s -c --arg sha "$RELEASE_SHA" \
-            --arg branch "$TEST_BRANCH" '
-              [.[] | select(.event == "workflow_dispatch"
-                and .head_sha == $sha and .head_branch == $branch)]
-              | sort_by(.created_at) | last // empty
-            ' <<< "$run_lines")
+            -f event=workflow_dispatch -F per_page=100 \
+            --jq '.workflow_runs[] | {id,event,display_title,status,conclusion,created_at,html_url}')
+          existing=$(jq -s -c --arg title "$TEST_TITLE" '
+            [.[] | select(.display_title == $title)]
+            | sort_by(.created_at) | last // empty
+          ' <<< "$run_lines")
 
           if [[ -n "$existing" ]]; then
             status=$(jq -r '.status' <<< "$existing")
@@ -420,42 +402,46 @@ jobs:
             run_id=$(jq -r '.id' <<< "$existing")
             if [[ "$status" != "completed" || "$conclusion" == "success" ]]; then
               echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-              echo "Reusing test run $run_id ($status)."
+              echo "Reusing merge-commit test run $run_id ($status)."
               exit 0
             fi
-            echo "Previous merge-commit test failed; starting a fresh test run."
+            echo "The prior test run failed; starting a fresh test run."
           fi
 
           dispatched_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
           gh workflow run docker.image.yml --repo "$REPOSITORY" \
-            --ref "$TEST_BRANCH" -f publish=false
+            --ref "$DEFAULT_BRANCH" \
+            -f publish=false -f source_ref="$RELEASE_SHA" \
+            -f test_id="$TEST_ID" -f image_version="$RELEASE_TAG"
           echo "dispatched_at=$dispatched_at" >> "$GITHUB_OUTPUT"
-          echo "Started test-only Docker CI for $RELEASE_SHA"
+          echo "Started tests for merge commit $RELEASE_SHA."
 
       - name: Wait for tests on the resulting merge commit
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
-          TEST_BRANCH: ${{ steps.test_branch.outputs.name }}
           RUN_ID: ${{ steps.test_dispatch.outputs.run_id }}
           DISPATCHED_AT: ${{ steps.test_dispatch.outputs.dispatched_at }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
+          TEST_ID="release-test-$RELEASE_TAG-$RELEASE_SHA"
+          TEST_TITLE="Docker Image CI $TEST_ID"
           deadline=$((SECONDS + 5400))
+
           while (( SECONDS < deadline )); do
             if [[ -n "$RUN_ID" ]]; then
               run=$(gh api "$API/actions/runs/$RUN_ID")
             else
               run_lines=$(gh api --paginate --method GET \
                 "$API/actions/workflows/docker.image.yml/runs" \
-                -f branch="$TEST_BRANCH" -F per_page=100 \
-                --jq '.workflow_runs[] | {id,event,head_sha,head_branch,status,conclusion,created_at,html_url}')
-              run=$(jq -s -c --arg sha "$RELEASE_SHA" \
-                --arg branch "$TEST_BRANCH" --arg since "$DISPATCHED_AT" '
-                  [.[] | select(.event == "workflow_dispatch"
-                    and .head_sha == $sha and .head_branch == $branch
+                -f event=workflow_dispatch -F per_page=100 \
+                --jq '.workflow_runs[] | {id,event,display_title,status,conclusion,created_at,html_url}')
+              run=$(jq -s -c --arg title "$TEST_TITLE" \
+                --arg since "$DISPATCHED_AT" '
+                  [.[] | select(.display_title == $title
                     and .created_at >= $since)]
                   | sort_by(.created_at) | last // empty
                 ' <<< "$run_lines")
@@ -468,7 +454,7 @@ jobs:
               run_url=$(jq -r '.html_url // empty' <<< "$run")
               if [[ "$status" == "completed" ]]; then
                 if [[ "$conclusion" != "success" ]]; then
-                  echo "::error::Merge-commit Docker CI $run_id ended: $conclusion"
+                  echo "::error::Merge-commit test run $run_id ended: $conclusion"
                   echo "$run_url"
                   exit 1
                 fi
@@ -476,28 +462,14 @@ jobs:
                 echo "CI run: $run_url"
                 exit 0
               fi
-              echo "Waiting for merge-commit CI run $run_id ($status)."
+              echo "Waiting for merge-commit test run $run_id ($status)."
             else
-              echo "Waiting for merge-commit CI run for $RELEASE_SHA."
+              echo "Waiting for test run $TEST_TITLE."
             fi
             sleep 30
           done
           echo "::error::Timed out waiting for merge-commit CI."
           exit 1
-
-      - name: Delete temporary test branch
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          TEST_BRANCH: ${{ steps.test_branch.outputs.name }}
-        run: |
-          set -euo pipefail
-          API="repos/$REPOSITORY"
-          if gh api --method DELETE "$API/git/refs/heads/$TEST_BRANCH"; then
-            echo "Deleted temporary test branch $TEST_BRANCH."
-          else
-            echo "::warning::Could not delete temporary test branch $TEST_BRANCH."
-          fi
 
       - name: Create tag only after merge-commit tests pass
         env:
@@ -553,50 +525,68 @@ jobs:
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
+          DEFAULT_BRANCH=$(gh api "$API" --jq '.default_branch')
+          PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA"
+          PUBLISH_TITLE="Docker Image CI $PUBLISH_ID"
+          publish_prefix="Docker Image CI release-publish-$RELEASE_TAG-"
 
-          # Include both tag-push and manually dispatched runs, with full
-          # pagination, so an existing publication is not duplicated.
+          # Include all pages plus legacy tag-push runs. New releases use
+          # the explicit run title because checkout and workflow refs differ.
           run_lines=$(gh api --paginate --method GET \
             "$API/actions/workflows/docker.image.yml/runs" \
-            -f branch="$RELEASE_TAG" -F per_page=100 \
-            --jq '.workflow_runs[] | {id,event,head_sha,head_branch,status,conclusion,created_at}')
-          latest=$(jq -s -c '
-            [.[] | select(.event == "push" or .event == "workflow_dispatch")]
-            | sort_by(.created_at) | last // empty
-          ' <<< "$run_lines")
+            -F per_page=100 \
+            --jq '.workflow_runs[] | {id,event,head_sha,head_branch,display_title,status,conclusion,created_at,html_url}')
+          latest=$(jq -s -c --arg tag "$RELEASE_TAG" \
+            --arg prefix "$publish_prefix" '
+              [.[] | select(
+                ((.head_branch == $tag)
+                  and (.event == "push" or .event == "workflow_dispatch"))
+                or ((.display_title // "") | startswith($prefix))
+              )]
+              | sort_by(.created_at) | last // empty
+            ' <<< "$run_lines")
           if [[ -n "$latest" ]]; then
-            latest_sha=$(jq -r '.head_sha' <<< "$latest")
+            latest_title=$(jq -r '.display_title // ""' <<< "$latest")
+            latest_sha=$(jq -r --arg prefix "$publish_prefix" '
+              if ((.display_title // "") | startswith($prefix))
+              then .display_title[($prefix | length):]
+              else .head_sha end
+            ' <<< "$latest")
             if [[ "$latest_sha" != "$RELEASE_SHA" ]]; then
-              echo "::error::The latest Docker CI run for this tag uses another commit."
-              echo "Refusing to overwrite an image published from a different SHA."
-              jq '{id,head_sha,status,conclusion}' <<< "$latest"
+              echo "::error::The latest publication for this tag used another commit."
+              echo "Refusing to overwrite the current tag's image."
+              jq '{id,head_sha,head_branch,display_title,status,conclusion}' <<< "$latest"
               exit 1
             fi
           fi
 
           existing=$(jq -s -c --arg sha "$RELEASE_SHA" \
-            --arg tag "$RELEASE_TAG" '
-              [.[] | select((.event == "push" or .event == "workflow_dispatch")
-                and .head_sha == $sha and .head_branch == $tag)]
+            --arg tag "$RELEASE_TAG" --arg title "$PUBLISH_TITLE" '
+              [.[] | select(
+                (.display_title == $title)
+                or ((.head_branch == $tag)
+                  and .head_sha == $sha
+                  and (.event == "push" or .event == "workflow_dispatch"))
+              )]
               | sort_by(.created_at) | last // empty
             ' <<< "$run_lines")
-
           if [[ -n "$existing" ]]; then
             status=$(jq -r '.status' <<< "$existing")
             conclusion=$(jq -r '.conclusion // empty' <<< "$existing")
             run_id=$(jq -r '.id' <<< "$existing")
             if [[ "$status" != "completed" || "$conclusion" == "success" ]]; then
               echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-              echo "Reusing Docker publication run $run_id ($status)."
+              echo "Reusing publication run $run_id ($status)."
               exit 0
             fi
-            echo "The previous publication run failed; starting a fresh run."
+            echo "The previous publication run failed; retrying it with a new run."
           fi
 
-          # Concurrency in docker.image.yml serializes all runs for this ref.
           dispatched_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
           gh workflow run docker.image.yml --repo "$REPOSITORY" \
-            --ref "$RELEASE_TAG" -f publish=true
+            --ref "$DEFAULT_BRANCH" \
+            -f publish=true -f source_ref="$RELEASE_SHA" \
+            -f test_id="$PUBLISH_ID" -f image_version="$RELEASE_TAG"
           echo "dispatched_at=$dispatched_at" >> "$GITHUB_OUTPUT"
           echo "Started Docker image publication for $RELEASE_TAG."
 
@@ -611,19 +601,21 @@ jobs:
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
+          PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA"
+          PUBLISH_TITLE="Docker Image CI $PUBLISH_ID"
           deadline=$((SECONDS + 5400))
+
           while (( SECONDS < deadline )); do
             if [[ -n "$RUN_ID" ]]; then
               run=$(gh api "$API/actions/runs/$RUN_ID")
             else
               run_lines=$(gh api --paginate --method GET \
                 "$API/actions/workflows/docker.image.yml/runs" \
-                -f branch="$RELEASE_TAG" -F per_page=100 \
-                --jq '.workflow_runs[] | {id,event,head_sha,head_branch,status,conclusion,created_at,html_url}')
-              run=$(jq -s -c --arg sha "$RELEASE_SHA" \
-                --arg tag "$RELEASE_TAG" --arg since "$DISPATCHED_AT" '
-                  [.[] | select((.event == "push" or .event == "workflow_dispatch")
-                    and .head_sha == $sha and .head_branch == $tag
+                -F per_page=100 \
+                --jq '.workflow_runs[] | {id,event,display_title,status,conclusion,created_at,html_url}')
+              run=$(jq -s -c --arg title "$PUBLISH_TITLE" \
+                --arg since "$DISPATCHED_AT" '
+                  [.[] | select(.display_title == $title
                     and .created_at >= $since)]
                   | sort_by(.created_at) | last // empty
                 ' <<< "$run_lines")
@@ -646,7 +638,7 @@ jobs:
               fi
               echo "Waiting for Docker publication run $run_id ($status)."
             else
-              echo "Waiting for Docker publication run for $RELEASE_TAG."
+              echo "Waiting for publication run $PUBLISH_TITLE."
             fi
             sleep 30
           done
