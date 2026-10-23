@@ -9,6 +9,7 @@ on:
         type: string
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -29,9 +30,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # This repository uses version-build tags such as 2.1.3-34.
-          if [[ ! "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$ ]]; then
-            echo "::error::Invalid tag '$RELEASE_TAG'. Expected version-build format, e.g. 2.1.3-35."
+          # Match the version-build format used by Docker Image CI.
+          if [[ ! "$RELEASE_TAG" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$ ]]; then
+            echo "::error::Invalid tag '$RELEASE_TAG'. Expected format like 2.1.3-35."
             exit 1
           fi
 
@@ -84,6 +85,7 @@ jobs:
           echo "development_sha=$development_sha" >> "$GITHUB_OUTPUT"
 
       - name: Merge release pull request
+        id: merge
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
@@ -98,13 +100,24 @@ jobs:
             exit 1
           fi
 
-          gh pr merge "$PR_NUMBER" --repo "$REPOSITORY" --merge --delete-branch=false
+          result=$(gh api --method PUT "repos/$REPOSITORY/pulls/$PR_NUMBER/merge" \
+            -f "sha=$EXPECTED_HEAD" -f "merge_method=merge")
+          if [[ $(jq -r '.merged' <<< "$result") != "true" ]]; then
+            echo "::error::GitHub did not merge pull request #$PR_NUMBER."
+            jq -r '.message // "No merge details returned."' <<< "$result"
+            exit 1
+          fi
+
+          merge_sha=$(jq -r '.sha' <<< "$result")
+          echo "sha=$merge_sha" >> "$GITHUB_OUTPUT"
+          echo "Merged pull request #$PR_NUMBER as $merge_sha"
 
       - name: Create tag on master merge commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
+          MERGE_SHA: ${{ steps.merge.outputs.sha }}
         run: |
           set -euo pipefail
 
@@ -114,18 +127,27 @@ jobs:
             exit 1
           fi
 
-          # Resolve the completed PR's merge commit, then verify master is there.
-          pr_number="${{ steps.pr.outputs.number }}"
-          merge_sha=$(gh pr view "$pr_number" --repo "$REPOSITORY" --json mergeCommit --jq '.mergeCommit.oid')
           master_sha=$(gh api "repos/$REPOSITORY/git/ref/heads/master" --jq '.object.sha')
-
-          if [[ -z "$merge_sha" || "$master_sha" != "$merge_sha" ]]; then
+          if [[ -z "$MERGE_SHA" || "$master_sha" != "$MERGE_SHA" ]]; then
             echo "::error::master does not point to the release PR merge commit; refusing to tag."
             exit 1
           fi
 
           gh api --method POST "repos/$REPOSITORY/git/refs" \
             -f "ref=refs/tags/$RELEASE_TAG" \
-            -f "sha=$merge_sha"
+            -f "sha=$MERGE_SHA"
 
-          echo "Created $RELEASE_TAG at $merge_sha"
+          echo "Created $RELEASE_TAG at $MERGE_SHA"
+
+      - name: Start Docker image CI for the release tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # GITHUB_TOKEN-created tags do not trigger push workflows.
+          # Explicit workflow_dispatch ensures the tag is tested and published.
+          gh workflow run docker.image.yml --repo "$REPOSITORY" --ref "$RELEASE_TAG"
+          echo "Started Docker Image CI for $RELEASE_TAG"
