@@ -119,7 +119,7 @@ jobs:
           else
             # Only a genuine 404 means the tag is absent. Auth, API and
             # network failures must stop before a merge can occur.
-            if ! grep -Eqi 'HTTP 404|Not Found' "$tag_error"; then
+            if ! grep -Eqi 'HTTP 404|status.?404' "$tag_error"; then
               cat "$tag_error"
               echo "::error::Could not safely determine whether the tag exists."
               exit 1
@@ -134,6 +134,20 @@ jobs:
               | last // empty
             ' <<< "$merged_prs")
 
+            if [[ -z "$merged_pr" ]]; then
+              # Older workflow versions used a generic title. Recover the
+              # latest such merge only when development has no unmerged commits.
+              comparison=$(gh api "$API/compare/master...development")
+              ahead=$(jq -r '.ahead_by' <<< "$comparison")
+              if [[ "$ahead" == "0" ]]; then
+                merged_pr=$(jq -c '
+                  [.[] | select(.title == "Release: development to master")]
+                  | sort_by(.mergedAt)
+                  | last // empty
+                ' <<< "$merged_prs")
+              fi
+            fi
+
             if [[ -n "$merged_pr" ]]; then
               release_sha=$(jq -r '.mergeCommit.oid // empty' <<< "$merged_pr")
               if [[ -z "$release_sha" ]]; then
@@ -142,7 +156,8 @@ jobs:
               fi
               assert_on_master_history "$release_sha"
               mode=merged
-              echo "Resuming already-merged release PR $(jq -r '.number' <<< "$merged_pr")."
+              pr_number=$(jq -r '.number' <<< "$merged_pr")
+              echo "Resuming already-merged release PR $pr_number."
             else
               release_sha=
               mode=fresh
@@ -320,16 +335,22 @@ jobs:
             "$API/actions/workflows/docker.image.yml/runs" \
             -f branch="$RELEASE_TAG" -F per_page=100 \
             --jq '.workflow_runs[] | {id,event,head_sha,status,conclusion,created_at}')
-          wrong=$(jq -s -c --arg sha "$RELEASE_SHA" '
-            [.[] | select((.event == "push" or .event == "workflow_dispatch")
-                and .head_sha != $sha)]
+          latest=$(jq -s -c '
+            [.[] | select(.event == "push" or .event == "workflow_dispatch")]
             | sort_by(.created_at) | last // empty
           ' <<< "$runs")
-          if [[ -n "$wrong" ]]; then
-            echo "::error::This tag has a Docker CI run for another commit."
-            echo "The tag/image history may have diverged; refusing to overwrite the release image."
-            jq '{id,head_sha,status,conclusion}' <<< "$wrong"
-            exit 1
+          if [[ -n "$latest" ]]; then
+            latest_sha=$(jq -r '.head_sha' <<< "$latest")
+            latest_status=$(jq -r '.status' <<< "$latest")
+            latest_conclusion=$(jq -r '.conclusion // empty' <<< "$latest")
+            if [[ "$latest_sha" != "$RELEASE_SHA" && \
+                  ( "$latest_status" != "completed" || \
+                    "$latest_conclusion" == "success" ) ]]; then
+              echo "::error::The latest Docker CI run for this tag uses another commit."
+              echo "Refusing to overwrite a running or successfully published image."
+              jq '{id,head_sha,status,conclusion}' <<< "$latest"
+              exit 1
+            fi
           fi
 
       - name: Create or reuse temporary test branch
@@ -351,7 +372,7 @@ jobs:
               exit 1
             fi
           else
-            if ! grep -Eqi 'HTTP 404|Not Found' "$err"; then
+            if ! grep -Eqi 'HTTP 404|status.?404' "$err"; then
               cat "$err"
               echo "::error::Cannot safely inspect the temporary test branch."
               exit 1
@@ -476,7 +497,6 @@ jobs:
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
-          master_sha=$(gh api "$API/git/ref/heads/master" --jq '.object.sha')
           comparison=$(gh api "$API/compare/$RELEASE_SHA...master")
           relation=$(jq -r '.status' <<< "$comparison")
           if [[ "$relation" != "ahead" && "$relation" != "identical" ]]; then
@@ -502,7 +522,7 @@ jobs:
             fi
             echo "Tag already points to the tested release commit."
           else
-            if ! grep -Eqi 'HTTP 404|Not Found' "$tag_error"; then
+            if ! grep -Eqi 'HTTP 404|status.?404' "$tag_error"; then
               cat "$tag_error"
               echo "::error::Cannot safely determine whether the release tag exists."
               exit 1
@@ -529,16 +549,22 @@ jobs:
             "$API/actions/workflows/docker.image.yml/runs" \
             -f branch="$RELEASE_TAG" -F per_page=100 \
             --jq '.workflow_runs[] | {id,event,head_sha,head_branch,status,conclusion,created_at}')
-          wrong=$(jq -s -c --arg sha "$RELEASE_SHA" '
-            [.[] | select((.event == "push" or .event == "workflow_dispatch")
-              and .head_sha != $sha)]
+          latest=$(jq -s -c '
+            [.[] | select(.event == "push" or .event == "workflow_dispatch")]
             | sort_by(.created_at) | last // empty
           ' <<< "$run_lines")
-          if [[ -n "$wrong" ]]; then
-            echo "::error::A Docker workflow for this tag used another commit."
-            echo "Refusing to overwrite an image published from a different SHA."
-            jq '{id,head_sha,status,conclusion}' <<< "$wrong"
-            exit 1
+          if [[ -n "$latest" ]]; then
+            latest_sha=$(jq -r '.head_sha' <<< "$latest")
+            latest_status=$(jq -r '.status' <<< "$latest")
+            latest_conclusion=$(jq -r '.conclusion // empty' <<< "$latest")
+            if [[ "$latest_sha" != "$RELEASE_SHA" && \
+                  ( "$latest_status" != "completed" || \
+                    "$latest_conclusion" == "success" ) ]]; then
+              echo "::error::The latest Docker CI run for this tag uses another commit."
+              echo "Refusing to overwrite an image published from a different SHA."
+              jq '{id,head_sha,status,conclusion}' <<< "$latest"
+              exit 1
+            fi
           fi
 
           existing=$(jq -s -c --arg sha "$RELEASE_SHA" \
