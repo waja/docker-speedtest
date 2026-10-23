@@ -110,9 +110,10 @@ jobs:
               --workflow docker.image.yml --branch development \
               --commit "$EXPECTED_HEAD" --limit 20 \
               --json databaseId,event,status,conclusion,headSha)
-            run=$(jq -c --arg sha "$EXPECTED_HEAD" \
-              '[.[] | select(.event == "push" and .headSha == $sha)]\
-               | .[0] // empty' <<< "$runs")
+            run=$(jq -c --arg sha "$EXPECTED_HEAD" '
+              [.[] | select(.event == "push" and .headSha == $sha)]
+              | .[0] // empty
+            ' <<< "$runs")
 
             if [[ -n "$run" ]]; then
               status=$(jq -r '.status' <<< "$run")
@@ -259,7 +260,8 @@ jobs:
 
           # Wait for the exact workflow_dispatch run started above.
           while (( SECONDS < deadline )); do
-            runs=$(gh api "$API/actions/workflows/docker.image.yml/runs?event=workflow_dispatch&per_page=100")
+            runs=$(gh api "$API/actions/workflows/docker.image.yml/runs" \
+              -f event=workflow_dispatch -F per_page=100)
             run=$(jq -c --arg sha "$MERGE_SHA" \
               --arg tag "$RELEASE_TAG" --arg since "$DISPATCHED_AT" '
                 [.workflow_runs[]
@@ -329,9 +331,14 @@ jobs:
             exit 0
           fi
 
+          body=$(printf '%s\n' \
+            "The Docker image release $RELEASE_TAG was built, tested," \
+            "and published successfully." \
+            "This PR brings changes present on master but missing from" \
+            "development back into the development branch.")
           pr_url=$(gh pr create --repo "$REPOSITORY" \
             --base development --head master \
             --title "Merge master back into development" \
-            --body "The Docker image release `$RELEASE_TAG` was built, tested, and published successfully. This PR brings changes present on `master` but missing from `development` back into the development branch.")
+            --body "$body")
 
           echo "Created back-merge PR: $pr_url"
