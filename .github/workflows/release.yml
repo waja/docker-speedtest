@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Validate tag and release state
+        id: validate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.tag }}
@@ -41,14 +42,26 @@ jobs:
             exit 1
           fi
 
-          if gh api "$API/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "::error::Tag '$RELEASE_TAG' already exists."
-            exit 1
+          if tag_ref=$(gh api "$API/git/ref/tags/$RELEASE_TAG" 2>/dev/null); then
+            # Allow recovery only when the tag is in master history.
+            release_sha=$(jq -r '.object.sha' <<< "$tag_ref")
+            comparison=$(gh api "$API/compare/$release_sha...master")
+            relation=$(jq -r '.status' <<< "$comparison")
+            if [[ "$relation" != "ahead" && "$relation" != "identical" ]]; then
+              echo "::error::Tag '$RELEASE_TAG' is not on master history."
+              exit 1
+            fi
+            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
+            echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
+            echo "Existing tag $RELEASE_TAG found; resuming release."
+          else
+            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
+            echo "release_sha=" >> "$GITHUB_OUTPUT"
+            echo "Validated new tag: $RELEASE_TAG"
           fi
 
-          echo "Validated tag: $RELEASE_TAG"
-
       - name: Check branches and prepare pull request
+        if: steps.validate.outputs.tag_exists != 'true'
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -94,6 +107,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Wait for CI on development
+        if: steps.validate.outputs.tag_exists != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
@@ -140,6 +154,7 @@ jobs:
           exit 1
 
       - name: Check mergeability and merge pull request
+        if: steps.validate.outputs.tag_exists != 'true'
         id: merge
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -204,6 +219,7 @@ jobs:
           echo "Merged PR #$PR_NUMBER as $merge_sha"
 
       - name: Create tag on master merge commit
+        if: steps.validate.outputs.tag_exists != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
@@ -230,16 +246,40 @@ jobs:
             -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$MERGE_SHA"
           echo "Created $RELEASE_TAG at $MERGE_SHA"
 
-      - name: Start Docker image CI for the release tag
+      - name: Start or resume Docker image CI for the release tag
         id: docker_dispatch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
+          MERGE_SHA: ${{ steps.merge.outputs.sha || steps.validate.outputs.release_sha }}
         run: |
           set -euo pipefail
+          API="repos/$REPOSITORY"
+
+          # Reuse a running or successful image workflow for this tag.
+          runs=$(gh api --method GET "$API/actions/workflows/docker.image.yml/runs" \
+            -f event=workflow_dispatch -F per_page=100)
+          existing=$(jq -c --arg sha "$MERGE_SHA" --arg tag "$RELEASE_TAG" '
+            [.workflow_runs[]
+              | select(.head_sha == $sha and .head_branch == $tag)]
+            | sort_by(.created_at)
+            | last // empty
+          ' <<< "$runs")
+
+          if [[ -n "$existing" ]]; then
+            status=$(jq -r '.status' <<< "$existing")
+            conclusion=$(jq -r '.conclusion // empty' <<< "$existing")
+            run_id=$(jq -r '.id' <<< "$existing")
+            if [[ "$status" != "completed" || "$conclusion" == "success" ]]; then
+              echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+              echo "Reusing Docker Image CI run $run_id ($status)."
+              exit 0
+            fi
+            echo "Latest image run failed; dispatching a retry."
+          fi
+
           # GITHUB_TOKEN tag creation does not trigger push workflows.
-          # Explicit dispatch starts the test-and-publish pipeline.
           dispatched_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
           gh workflow run docker.image.yml \
             --repo "$REPOSITORY" --ref "$RELEASE_TAG"
@@ -251,29 +291,34 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
-          MERGE_SHA: ${{ steps.merge.outputs.sha }}
+          MERGE_SHA: ${{ steps.merge.outputs.sha || steps.validate.outputs.release_sha }}
+          RUN_ID: ${{ steps.docker_dispatch.outputs.run_id }}
           DISPATCHED_AT: ${{ steps.docker_dispatch.outputs.dispatched_at }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
           deadline=$((SECONDS + 5400))
 
-          # Wait for the exact workflow_dispatch run started above.
+          # Resume an existing run by ID or find the run just dispatched.
           while (( SECONDS < deadline )); do
-            runs=$(gh api --method GET \
-              "$API/actions/workflows/docker.image.yml/runs" \
-              -f event=workflow_dispatch -F per_page=100)
-            run=$(jq -c --arg sha "$MERGE_SHA" \
-              --arg tag "$RELEASE_TAG" --arg since "$DISPATCHED_AT" '
-                [.workflow_runs[]
-                  | select(
-                      .head_sha == $sha
-                      and .head_branch == $tag
-                      and .created_at >= $since
-                    )]
-                | sort_by(.created_at)
-                | last // empty
-              ' <<< "$runs")
+            if [[ -n "$RUN_ID" ]]; then
+              run=$(gh api "$API/actions/runs/$RUN_ID")
+            else
+              runs=$(gh api --method GET \
+                "$API/actions/workflows/docker.image.yml/runs" \
+                -f event=workflow_dispatch -F per_page=100)
+              run=$(jq -c --arg sha "$MERGE_SHA" \
+                --arg tag "$RELEASE_TAG" --arg since "$DISPATCHED_AT" '
+                  [.workflow_runs[]
+                    | select(
+                        .head_sha == $sha
+                        and .head_branch == $tag
+                        and .created_at >= $since
+                      )]
+                  | sort_by(.created_at)
+                  | last // empty
+                ' <<< "$runs")
+            fi
 
             if [[ -n "$run" ]]; then
               status=$(jq -r '.status' <<< "$run")
