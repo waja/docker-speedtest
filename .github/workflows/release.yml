@@ -1,7 +1,7 @@
 ---
 name: Release
 
-# checkov:skip=CKV_GHA_7: A validated tag input is required for releases.
+# checkov:skip=CKV_GHA_7: Releases require a validated tag input.
 on:
   workflow_dispatch:
     inputs:
@@ -15,26 +15,66 @@ permissions:
   contents: write
   pull-requests: write
 
+# Different tags must not replace one another in GitHub's pending slot.
+# The first job below serializes distinct releases in run-number order.
 concurrency:
-  group: release-master
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
   release:
-    name: Merge development and create tag
+    name: Merge, test and publish release
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
-      - name: Validate tag and release state
+      - name: Wait for earlier release requests
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          CURRENT_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          API="repos/$REPOSITORY"
+
+          # Native global concurrency can discard pending runs. Keep every
+          # distinct release request and wait for older dispatches instead.
+          deadline=$((SECONDS + 21000))
+          while (( SECONDS < deadline )); do
+            run_lines=$(gh api --paginate --method GET \
+              "$API/actions/workflows/release.yml/runs" \
+              -f event=workflow_dispatch -F per_page=100 \
+              --jq '.workflow_runs[] | {id,run_number,status,event}')
+            older=$(jq -s -r --argjson current "$CURRENT_RUN_NUMBER" '
+              [.[]
+                | select(.event == "workflow_dispatch"
+                    and .run_number < $current
+                    and .status != "completed")]
+              | sort_by(.run_number)
+              | .[0].id // empty
+            ' <<< "$run_lines")
+
+            if [[ -z "$older" ]]; then
+              echo "No earlier release requests are running."
+              exit 0
+            fi
+            echo "Waiting for earlier release run $older to finish."
+            sleep 15
+          done
+
+          echo "::error::Timed out waiting in the release queue."
+          exit 1
+
+      - name: Validate tag and detect release state
         id: validate
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.tag }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
 
-          # Match the version-build format used by Docker Image CI.
+          # This project's tags use version-build names such as 2.1.3-35.
           tag_pattern='^[0-9]{1,3}\.[0-9]{1,3}\.'
           tag_pattern+='[0-9]{1,3}-[0-9]{1,3}$'
           if [[ ! "$RELEASE_TAG" =~ $tag_pattern ]]; then
@@ -42,62 +82,132 @@ jobs:
             exit 1
           fi
 
-          if tag_ref=$(gh api "$API/git/ref/tags/$RELEASE_TAG" \
-            2>/dev/null); then
-            # Allow recovery only when the tag is in master history.
-            release_sha=$(jq -r '.object.sha' <<< "$tag_ref")
-            comparison=$(gh api "$API/compare/$release_sha...master")
+          # Resolve lightweight and annotated tags to their commit SHA.
+          resolve_tag_commit() {
+            local tag_json="$1" object_type object_sha tag_object
+            object_type=$(jq -r '.object.type' <<< "$tag_json")
+            object_sha=$(jq -r '.object.sha' <<< "$tag_json")
+            while [[ "$object_type" == "tag" ]]; do
+              tag_object=$(gh api "$API/git/tags/$object_sha")
+              object_type=$(jq -r '.object.type' <<< "$tag_object")
+              object_sha=$(jq -r '.object.sha' <<< "$tag_object")
+            done
+            if [[ "$object_type" != "commit" ]]; then
+              echo "::error::Tag does not resolve to a commit."
+              return 1
+            fi
+            printf '%s' "$object_sha"
+          }
+
+          assert_on_master_history() {
+            local sha="$1" comparison relation
+            comparison=$(gh api "$API/compare/$sha...master")
             relation=$(jq -r '.status' <<< "$comparison")
             if [[ "$relation" != "ahead" && "$relation" != "identical" ]]; then
-              echo "::error::Tag '$RELEASE_TAG' is not on master history."
+              echo "::error::Commit $sha is not in master history."
+              return 1
+            fi
+          }
+
+          tag_file=$(mktemp)
+          tag_error=$(mktemp)
+          if gh api "$API/git/ref/tags/$RELEASE_TAG" >"$tag_file" 2>"$tag_error"; then
+            release_sha=$(resolve_tag_commit "$(cat "$tag_file")")
+            assert_on_master_history "$release_sha"
+            mode=tagged
+            echo "Existing tag $RELEASE_TAG resolves to $release_sha."
+          else
+            # Only a genuine 404 means the tag is absent. Auth, API and
+            # network failures must stop before a merge can occur.
+            if ! grep -Eqi 'HTTP 404|Not Found' "$tag_error"; then
+              cat "$tag_error"
+              echo "::error::Could not safely determine whether the tag exists."
               exit 1
             fi
-            echo "tag_exists=true" >> "$GITHUB_OUTPUT"
-            echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
-            echo "Existing tag $RELEASE_TAG found; resuming release."
-          else
-            echo "tag_exists=false" >> "$GITHUB_OUTPUT"
-            echo "release_sha=" >> "$GITHUB_OUTPUT"
-            echo "Validated new tag: $RELEASE_TAG"
+
+            merged_prs=$(gh pr list --repo "$REPOSITORY" --state merged \
+              --base master --head development --limit 100 \
+              --json number,title,mergedAt,mergeCommit,url)
+            merged_pr=$(jq -c --arg title "Release: $RELEASE_TAG" '
+              [.[] | select(.title == $title)]
+              | sort_by(.mergedAt)
+              | last // empty
+            ' <<< "$merged_prs")
+
+            if [[ -n "$merged_pr" ]]; then
+              release_sha=$(jq -r '.mergeCommit.oid // empty' <<< "$merged_pr")
+              if [[ -z "$release_sha" ]]; then
+                echo "::error::Merged release PR has no merge commit SHA."
+                exit 1
+              fi
+              assert_on_master_history "$release_sha"
+              mode=merged
+              echo "Resuming already-merged release PR $(jq -r '.number' <<< "$merged_pr")."
+            else
+              release_sha=
+              mode=fresh
+              echo "No tag or merged release PR found; starting a new release."
+            fi
           fi
 
-      - name: Check branches and prepare pull request
-        if: steps.validate.outputs.tag_exists != 'true'
+          {
+            echo "mode=$mode"
+            echo "release_sha=$release_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release pull request
+        if: steps.validate.outputs.mode == 'fresh'
         id: pr
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
-
           master_sha=$(gh api "$API/git/ref/heads/master" --jq '.object.sha')
           development_sha=$(gh api "$API/git/ref/heads/development" \
             --jq '.object.sha')
-
           comparison=$(gh api "$API/compare/master...development")
           ahead=$(jq -r '.ahead_by' <<< "$comparison")
           behind=$(jq -r '.behind_by' <<< "$comparison")
 
-          # development must contain at least one commit not on master.
-          # master-only commits are allowed; the PR mergeability check below
-          # determines whether the two branch histories can be combined.
           if [[ "$ahead" == "0" ]]; then
-            echo "::error::development has no new commits to release."
+            echo "::error::development has no commits to release."
+            echo "If a previous attempt merged this release, retry after the tag is restored or inspect master."
             exit 1
           fi
-
           echo "development ahead by $ahead; master ahead by $behind commits."
 
-          pr_number=$(gh pr list --repo "$REPOSITORY" --state open \
-            --base master --head development \
-            --json number --jq '.[0].number // empty')
+          title="Release: $RELEASE_TAG"
+          open_prs=$(gh pr list --repo "$REPOSITORY" --state open \
+            --base master --head development --limit 100 \
+            --json number,title)
+          pr=$(jq -c --arg title "$title" \
+            '[.[] | select(.title == $title)] | .[0] // empty' <<< "$open_prs")
+          if [[ -z "$pr" ]]; then
+            # Reuse any pre-existing PR for these branches and label it with
+            # this tag so an untagged merge can be resumed unambiguously.
+            pr=$(jq -c '.[0] // empty' <<< "$open_prs")
+          fi
 
-          if [[ -z "$pr_number" ]]; then
-            pr_url=$(gh pr create --repo "$REPOSITORY" \
-              --base master --head development \
-              --title "Release: development to master" \
-              --body "Automated release PR for the requested tag.")
+          if [[ -n "$pr" ]]; then
+            pr_number=$(jq -r '.number' <<< "$pr")
+            pr_title=$(jq -r '.title' <<< "$pr")
+            if [[ "$pr_title" != "$title" ]]; then
+              gh pr edit "$pr_number" --repo "$REPOSITORY" --title "$title"
+            fi
+          else
+            body=$(printf '%s\n' \
+              "Automated release for tag $RELEASE_TAG." \
+              "The workflow tests the resulting merge commit before tagging" \
+              "and publishing the Docker image.")
+            if ! pr_url=$(gh pr create --repo "$REPOSITORY" \
+              --base master --head development --title "$title" --body "$body"); then
+              echo "::error::Could not create the release PR."
+              echo "Enable Actions PR creation in repository settings or configure the RELEASE_TOKEN secret with repo write permissions."
+              exit 1
+            fi
             pr_number=${pr_url##*/}
           fi
 
@@ -107,58 +217,11 @@ jobs:
             echo "development_sha=$development_sha"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Wait for CI on development
-        if: steps.validate.outputs.tag_exists != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          EXPECTED_HEAD: ${{ steps.pr.outputs.development_sha }}
-        run: |
-          set -euo pipefail
-
-          # A workflow_dispatch-created PR does not reliably trigger a new
-          # pull_request run when GITHUB_TOKEN created it. Gate on the
-          # Docker Image CI run for this exact development commit instead.
-          deadline=$((SECONDS + 1800))
-          while (( SECONDS < deadline )); do
-            runs=$(gh run list --repo "$REPOSITORY" \
-              --workflow docker.image.yml --branch development \
-              --commit "$EXPECTED_HEAD" --limit 20 \
-              --json databaseId,event,status,conclusion,headSha)
-            run=$(jq -c --arg sha "$EXPECTED_HEAD" '
-              [.[] | select(.event == "push" and .headSha == $sha)]
-              | .[0] // empty
-            ' <<< "$runs")
-
-            if [[ -n "$run" ]]; then
-              status=$(jq -r '.status' <<< "$run")
-              conclusion=$(jq -r '.conclusion // empty' <<< "$run")
-              run_id=$(jq -r '.databaseId' <<< "$run")
-
-              if [[ "$status" == "completed" ]]; then
-                if [[ "$conclusion" != "success" ]]; then
-                  echo "::error::Docker Image CI run $run_id ended: $conclusion"
-                  exit 1
-                fi
-                echo "Docker Image CI passed for $EXPECTED_HEAD."
-                exit 0
-              fi
-
-              echo "Waiting for Docker Image CI run $run_id ($status)."
-            else
-              echo "Waiting for Docker Image CI run for $EXPECTED_HEAD."
-            fi
-            sleep 10
-          done
-
-          echo "::error::Timed out waiting for Docker Image CI (30 minutes)."
-          exit 1
-
-      - name: Check mergeability and merge pull request
-        if: steps.validate.outputs.tag_exists != 'true'
+      - name: Merge release pull request
+        if: steps.validate.outputs.mode == 'fresh'
         id: merge
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           EXPECTED_HEAD: ${{ steps.pr.outputs.development_sha }}
@@ -166,7 +229,6 @@ jobs:
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
-
           current_head=$(gh api "$API/git/ref/heads/development" \
             --jq '.object.sha')
           current_base=$(gh api "$API/git/ref/heads/master" \
@@ -174,44 +236,46 @@ jobs:
           if [[ "$current_head" != "$EXPECTED_HEAD" || \
                 "$current_base" != "$EXPECTED_BASE" ]]; then
             echo "::error::development or master changed during release."
-            echo "Restart the workflow to release the updated branch state."
+            echo "Restart to release the current branch state safely."
             exit 1
           fi
 
-          # GitHub calculates mergeability asynchronously after PR creation.
-          mergeable="unknown"
+          # Wait for GitHub's asynchronous mergeability calculation.
+          mergeable=unknown
           for ((attempt = 1; attempt <= 24; attempt++)); do
             pr=$(gh api "$API/pulls/$PR_NUMBER")
             pr_head=$(jq -r '.head.sha' <<< "$pr")
             pr_base=$(jq -r '.base.sha' <<< "$pr")
             mergeable=$(jq -r '.mergeable // "unknown"' <<< "$pr")
-
             if [[ "$pr_head" != "$EXPECTED_HEAD" || \
                   "$pr_base" != "$EXPECTED_BASE" ]]; then
-              echo "::error::The pull request head or base changed."
+              echo "::error::The release PR head or base changed."
               exit 1
             fi
-            if [[ "$mergeable" == "true" ]]; then
-              break
-            fi
+            if [[ "$mergeable" == "true" ]]; then break; fi
             if [[ "$mergeable" == "false" ]]; then
-              echo "::error::The branches have merge conflicts."
-              echo "Resolve conflicts and restart the release workflow."
+              echo "::error::The release PR has merge conflicts."
               exit 1
             fi
             sleep 5
           done
-
           if [[ "$mergeable" != "true" ]]; then
             echo "::error::GitHub could not determine PR mergeability."
             exit 1
           fi
 
-          result=$(gh api --method PUT "$API/pulls/$PR_NUMBER/merge" \
-            -f "sha=$EXPECTED_HEAD" -f "merge_method=merge")
-          if [[ $(jq -r '.merged' <<< "$result") != "true" ]]; then
-            echo "::error::GitHub did not merge PR #$PR_NUMBER."
-            jq -r '.message // "No merge details returned."' <<< "$result"
+          err=$(mktemp)
+          if result=$(gh api --method PUT "$API/pulls/$PR_NUMBER/merge" \
+            -f "sha=$EXPECTED_HEAD" -f "merge_method=merge" 2>"$err"); then
+            if [[ $(jq -r '.merged' <<< "$result") != "true" ]]; then
+              echo "::error::GitHub did not merge PR #$PR_NUMBER."
+              jq -r '.message // "No merge details returned."' <<< "$result"
+              exit 1
+            fi
+          else
+            cat "$err"
+            echo "::error::The merge was rejected by GitHub or branch rules."
+            echo "If master requires human approval, approve the PR and retry this workflow."
             exit 1
           fi
 
@@ -219,179 +283,378 @@ jobs:
           echo "sha=$merge_sha" >> "$GITHUB_OUTPUT"
           echo "Merged PR #$PR_NUMBER as $merge_sha"
 
-      - name: Create tag on master merge commit
-        if: steps.validate.outputs.tag_exists != 'true'
+      - name: Resolve release commit and verify master history
+        id: release_commit
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
-          RELEASE_TAG: ${{ inputs.tag }}
-          MERGE_SHA: ${{ steps.merge.outputs.sha }}
-        run: |
-          set -euo pipefail
-          API="repos/$REPOSITORY"
-
-          # Never overwrite an existing tag.
-          if gh api "$API/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "::error::Tag '$RELEASE_TAG' already exists."
-            exit 1
-          fi
-
-          master_sha=$(gh api "$API/git/ref/heads/master" --jq '.object.sha')
-          if [[ -z "$MERGE_SHA" || "$master_sha" != "$MERGE_SHA" ]]; then
-            echo "::error::master no longer points to the merge commit."
-            echo "Refusing to create a tag on a different commit."
-            exit 1
-          fi
-
-          gh api --method POST "$API/git/refs" \
-            -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$MERGE_SHA"
-          echo "Created $RELEASE_TAG at $MERGE_SHA"
-
-      - name: Start or resume Docker image CI for the release tag
-        id: docker_dispatch
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          RELEASE_TAG: ${{ inputs.tag }}
-          MERGE_SHA: >-
+          RELEASE_SHA: >-
             ${{ steps.merge.outputs.sha ||
                 steps.validate.outputs.release_sha }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
+          if [[ -z "$RELEASE_SHA" ]]; then
+            echo "::error::No release commit SHA was found."
+            exit 1
+          fi
+          comparison=$(gh api "$API/compare/$RELEASE_SHA...master")
+          relation=$(jq -r '.status' <<< "$comparison")
+          if [[ "$relation" != "ahead" && "$relation" != "identical" ]]; then
+            echo "::error::Release commit is no longer in master history."
+            exit 1
+          fi
+          echo "sha=$RELEASE_SHA" >> "$GITHUB_OUTPUT"
 
-          # Reuse a running or successful image workflow for this tag.
-          runs=$(gh api --method GET \
+      - name: Refuse a tag whose image history points to another commit
+        if: steps.validate.outputs.mode == 'tagged'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          API="repos/$REPOSITORY"
+          runs=$(gh api --paginate --method GET \
             "$API/actions/workflows/docker.image.yml/runs" \
-            -f event=workflow_dispatch -F per_page=100)
-          existing=$(jq -c --arg sha "$MERGE_SHA" --arg tag "$RELEASE_TAG" '
-            [.workflow_runs[]
-              | select(.head_sha == $sha and .head_branch == $tag)]
-            | sort_by(.created_at)
-            | last // empty
+            -f branch="$RELEASE_TAG" -F per_page=100 \
+            --jq '.workflow_runs[] | {id,event,head_sha,status,conclusion,created_at}')
+          wrong=$(jq -s -c --arg sha "$RELEASE_SHA" '
+            [.[] | select((.event == "push" or .event == "workflow_dispatch")
+                and .head_sha != $sha)]
+            | sort_by(.created_at) | last // empty
           ' <<< "$runs")
+          if [[ -n "$wrong" ]]; then
+            echo "::error::This tag has a Docker CI run for another commit."
+            echo "The tag/image history may have diverged; refusing to overwrite the release image."
+            jq '{id,head_sha,status,conclusion}' <<< "$wrong"
+            exit 1
+          fi
+
+      - name: Create or reuse temporary test branch
+        id: test_branch
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          API="repos/$REPOSITORY"
+          branch="release-test-$RELEASE_TAG"
+          err=$(mktemp)
+          if ref=$(gh api "$API/git/ref/heads/$branch" 2>"$err"); then
+            branch_sha=$(jq -r '.object.sha' <<< "$ref")
+            if [[ "$branch_sha" != "$RELEASE_SHA" ]]; then
+              echo "::error::Temporary test branch already points elsewhere."
+              exit 1
+            fi
+          else
+            if ! grep -Eqi 'HTTP 404|Not Found' "$err"; then
+              cat "$err"
+              echo "::error::Cannot safely inspect the temporary test branch."
+              exit 1
+            fi
+            gh api --method POST "$API/git/refs" \
+              -f "ref=refs/heads/$branch" -f "sha=$RELEASE_SHA"
+          fi
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Start or reuse tests for the resulting merge commit
+        id: test_dispatch
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+          TEST_BRANCH: ${{ steps.test_branch.outputs.name }}
+        run: |
+          set -euo pipefail
+          API="repos/$REPOSITORY"
+          run_lines=$(gh api --paginate --method GET \
+            "$API/actions/workflows/docker.image.yml/runs" \
+            -f branch="$TEST_BRANCH" -F per_page=100 \
+            --jq '.workflow_runs[] | {id,event,head_sha,head_branch,status,conclusion,created_at}')
+          existing=$(jq -s -c --arg sha "$RELEASE_SHA" \
+            --arg branch "$TEST_BRANCH" '
+              [.[] | select(.event == "workflow_dispatch"
+                and .head_sha == $sha and .head_branch == $branch)]
+              | sort_by(.created_at) | last // empty
+            ' <<< "$run_lines")
 
           if [[ -n "$existing" ]]; then
             status=$(jq -r '.status' <<< "$existing")
             conclusion=$(jq -r '.conclusion // empty' <<< "$existing")
             run_id=$(jq -r '.id' <<< "$existing")
-            if [[ "$status" != "completed" || \
-                  "$conclusion" == "success" ]]; then
+            if [[ "$status" != "completed" || "$conclusion" == "success" ]]; then
               echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-              echo "Reusing Docker Image CI run $run_id ($status)."
+              echo "Reusing test run $run_id ($status)."
               exit 0
             fi
-            echo "Latest image run failed; dispatching a retry."
+            echo "Previous merge-commit test failed; starting a fresh test run."
           fi
 
-          # GITHUB_TOKEN tag creation does not trigger push workflows.
           dispatched_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-          gh workflow run docker.image.yml \
-            --repo "$REPOSITORY" --ref "$RELEASE_TAG"
+          gh workflow run docker.image.yml --repo "$REPOSITORY" \
+            --ref "$TEST_BRANCH" -f publish=false
           echo "dispatched_at=$dispatched_at" >> "$GITHUB_OUTPUT"
-          echo "Started Docker Image CI for $RELEASE_TAG"
+          echo "Started test-only Docker CI for $RELEASE_SHA"
 
-      - name: Wait for Docker build and image publication
+      - name: Wait for tests on the resulting merge commit
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+          TEST_BRANCH: ${{ steps.test_branch.outputs.name }}
+          RUN_ID: ${{ steps.test_dispatch.outputs.run_id }}
+          DISPATCHED_AT: ${{ steps.test_dispatch.outputs.dispatched_at }}
+        run: |
+          set -euo pipefail
+          API="repos/$REPOSITORY"
+          deadline=$((SECONDS + 5400))
+          while (( SECONDS < deadline )); do
+            if [[ -n "$RUN_ID" ]]; then
+              run=$(gh api "$API/actions/runs/$RUN_ID")
+            else
+              run_lines=$(gh api --paginate --method GET \
+                "$API/actions/workflows/docker.image.yml/runs" \
+                -f branch="$TEST_BRANCH" -F per_page=100 \
+                --jq '.workflow_runs[] | {id,event,head_sha,head_branch,status,conclusion,created_at,html_url}')
+              run=$(jq -s -c --arg sha "$RELEASE_SHA" \
+                --arg branch "$TEST_BRANCH" --arg since "$DISPATCHED_AT" '
+                  [.[] | select(.event == "workflow_dispatch"
+                    and .head_sha == $sha and .head_branch == $branch
+                    and .created_at >= $since)]
+                  | sort_by(.created_at) | last // empty
+                ' <<< "$run_lines")
+            fi
+
+            if [[ -n "$run" && "$run" != "null" ]]; then
+              status=$(jq -r '.status' <<< "$run")
+              conclusion=$(jq -r '.conclusion // empty' <<< "$run")
+              run_id=$(jq -r '.id' <<< "$run")
+              run_url=$(jq -r '.html_url // empty' <<< "$run")
+              if [[ "$status" == "completed" ]]; then
+                if [[ "$conclusion" != "success" ]]; then
+                  echo "::error::Merge-commit Docker CI $run_id ended: $conclusion"
+                  echo "$run_url"
+                  exit 1
+                fi
+                echo "Tests passed for merge commit $RELEASE_SHA."
+                echo "CI run: $run_url"
+                exit 0
+              fi
+              echo "Waiting for merge-commit CI run $run_id ($status)."
+            else
+              echo "Waiting for merge-commit CI run for $RELEASE_SHA."
+            fi
+            sleep 30
+          done
+          echo "::error::Timed out waiting for merge-commit CI."
+          exit 1
+
+      - name: Delete temporary test branch
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TEST_BRANCH: ${{ steps.test_branch.outputs.name }}
+        run: |
+          set -euo pipefail
+          API="repos/$REPOSITORY"
+          if gh api --method DELETE "$API/git/refs/heads/$TEST_BRANCH"; then
+            echo "Deleted temporary test branch $TEST_BRANCH."
+          else
+            echo "::warning::Could not delete temporary test branch $TEST_BRANCH."
+          fi
+
+      - name: Create tag only after merge-commit tests pass
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
-          MERGE_SHA: >-
-            ${{ steps.merge.outputs.sha ||
-                steps.validate.outputs.release_sha }}
+          RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          API="repos/$REPOSITORY"
+          master_sha=$(gh api "$API/git/ref/heads/master" --jq '.object.sha')
+          comparison=$(gh api "$API/compare/$RELEASE_SHA...master")
+          relation=$(jq -r '.status' <<< "$comparison")
+          if [[ "$relation" != "ahead" && "$relation" != "identical" ]]; then
+            echo "::error::Release commit is no longer in master history."
+            exit 1
+          fi
+
+          tag_file=$(mktemp)
+          tag_error=$(mktemp)
+          if gh api "$API/git/ref/tags/$RELEASE_TAG" >"$tag_file" 2>"$tag_error"; then
+            existing_tag=$(cat "$tag_file")
+            tag_type=$(jq -r '.object.type' <<< "$existing_tag")
+            tag_sha=$(jq -r '.object.sha' <<< "$existing_tag")
+            while [[ "$tag_type" == "tag" ]]; do
+              tag_obj=$(gh api "$API/git/tags/$tag_sha")
+              tag_type=$(jq -r '.object.type' <<< "$tag_obj")
+              tag_sha=$(jq -r '.object.sha' <<< "$tag_obj")
+            done
+            if [[ "$tag_type" != "commit" || "$tag_sha" != "$RELEASE_SHA" ]]; then
+              echo "::error::Tag $RELEASE_TAG already exists on another commit."
+              echo "Tags are immutable here; choose a new tag rather than overwriting it."
+              exit 1
+            fi
+            echo "Tag already points to the tested release commit."
+          else
+            if ! grep -Eqi 'HTTP 404|Not Found' "$tag_error"; then
+              cat "$tag_error"
+              echo "::error::Cannot safely determine whether the release tag exists."
+              exit 1
+            fi
+            gh api --method POST "$API/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$RELEASE_SHA"
+            echo "Created $RELEASE_TAG at tested commit $RELEASE_SHA."
+          fi
+
+      - name: Start or resume Docker image publication
+        id: docker_dispatch
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          API="repos/$REPOSITORY"
+
+          # Include both tag-push and manually dispatched runs, with full
+          # pagination, so an existing publication is not duplicated.
+          run_lines=$(gh api --paginate --method GET \
+            "$API/actions/workflows/docker.image.yml/runs" \
+            -f branch="$RELEASE_TAG" -F per_page=100 \
+            --jq '.workflow_runs[] | {id,event,head_sha,head_branch,status,conclusion,created_at}')
+          wrong=$(jq -s -c --arg sha "$RELEASE_SHA" '
+            [.[] | select((.event == "push" or .event == "workflow_dispatch")
+              and .head_sha != $sha)]
+            | sort_by(.created_at) | last // empty
+          ' <<< "$run_lines")
+          if [[ -n "$wrong" ]]; then
+            echo "::error::A Docker workflow for this tag used another commit."
+            echo "Refusing to overwrite an image published from a different SHA."
+            jq '{id,head_sha,status,conclusion}' <<< "$wrong"
+            exit 1
+          fi
+
+          existing=$(jq -s -c --arg sha "$RELEASE_SHA" \
+            --arg tag "$RELEASE_TAG" '
+              [.[] | select((.event == "push" or .event == "workflow_dispatch")
+                and .head_sha == $sha and .head_branch == $tag)]
+              | sort_by(.created_at) | last // empty
+            ' <<< "$run_lines")
+
+          if [[ -n "$existing" ]]; then
+            status=$(jq -r '.status' <<< "$existing")
+            conclusion=$(jq -r '.conclusion // empty' <<< "$existing")
+            run_id=$(jq -r '.id' <<< "$existing")
+            if [[ "$status" != "completed" || "$conclusion" == "success" ]]; then
+              echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+              echo "Reusing Docker publication run $run_id ($status)."
+              exit 0
+            fi
+            echo "The previous publication run failed; starting a fresh run."
+          fi
+
+          # Concurrency in docker.image.yml serializes all runs for this ref.
+          dispatched_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          gh workflow run docker.image.yml --repo "$REPOSITORY" \
+            --ref "$RELEASE_TAG" -f publish=true
+          echo "dispatched_at=$dispatched_at" >> "$GITHUB_OUTPUT"
+          echo "Started Docker image publication for $RELEASE_TAG."
+
+      - name: Wait for Docker image tests and publication
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           RUN_ID: ${{ steps.docker_dispatch.outputs.run_id }}
           DISPATCHED_AT: ${{ steps.docker_dispatch.outputs.dispatched_at }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
           deadline=$((SECONDS + 5400))
-
-          # Resume an existing run by ID or find the run just dispatched.
           while (( SECONDS < deadline )); do
             if [[ -n "$RUN_ID" ]]; then
               run=$(gh api "$API/actions/runs/$RUN_ID")
             else
-              runs=$(gh api --method GET \
+              run_lines=$(gh api --paginate --method GET \
                 "$API/actions/workflows/docker.image.yml/runs" \
-                -f event=workflow_dispatch -F per_page=100)
-              run=$(jq -c --arg sha "$MERGE_SHA" \
+                -f branch="$RELEASE_TAG" -F per_page=100 \
+                --jq '.workflow_runs[] | {id,event,head_sha,head_branch,status,conclusion,created_at,html_url}')
+              run=$(jq -s -c --arg sha "$RELEASE_SHA" \
                 --arg tag "$RELEASE_TAG" --arg since "$DISPATCHED_AT" '
-                  [.workflow_runs[]
-                    | select(
-                        .head_sha == $sha
-                        and .head_branch == $tag
-                        and .created_at >= $since
-                      )]
-                  | sort_by(.created_at)
-                  | last // empty
-                ' <<< "$runs")
+                  [.[] | select((.event == "push" or .event == "workflow_dispatch")
+                    and .head_sha == $sha and .head_branch == $tag
+                    and .created_at >= $since)]
+                  | sort_by(.created_at) | last // empty
+                ' <<< "$run_lines")
             fi
 
-            if [[ -n "$run" ]]; then
+            if [[ -n "$run" && "$run" != "null" ]]; then
               status=$(jq -r '.status' <<< "$run")
               conclusion=$(jq -r '.conclusion // empty' <<< "$run")
               run_id=$(jq -r '.id' <<< "$run")
-              run_url=$(jq -r '.html_url' <<< "$run")
-
+              run_url=$(jq -r '.html_url // empty' <<< "$run")
               if [[ "$status" == "completed" ]]; then
                 if [[ "$conclusion" != "success" ]]; then
-                  echo "::error::Docker Image CI run $run_id ended: $conclusion"
-                  echo "See $run_url"
+                  echo "::error::Docker publication run $run_id ended: $conclusion"
+                  echo "$run_url"
                   exit 1
                 fi
-                echo "Docker build, tests and publication succeeded."
+                echo "Docker tests and image publication succeeded."
                 echo "Workflow run: $run_url"
                 exit 0
               fi
-
-              echo "Waiting for Docker Image CI run $run_id ($status)."
+              echo "Waiting for Docker publication run $run_id ($status)."
             else
-              echo "Waiting for Docker Image CI run for $RELEASE_TAG."
+              echo "Waiting for Docker publication run for $RELEASE_TAG."
             fi
             sleep 30
           done
-
-          echo "::error::Timed out waiting for Docker build and publication."
+          echo "::error::Timed out waiting for Docker image publication."
           exit 1
 
       - name: Open back-merge PR if master has changes
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
-
-          # Compare in PR direction. The diff excludes the release merge
-          # commit itself when it contains no master-only file changes.
           comparison=$(gh api "$API/compare/development...master")
+          master_ahead=$(jq -r '.ahead_by' <<< "$comparison")
           changed_files=$(jq '.files | length' <<< "$comparison")
 
-          if [[ "$changed_files" == "0" ]]; then
-            echo "No master-only file changes to back-merge."
+          if [[ "$master_ahead" == "0" || "$changed_files" == "0" ]]; then
+            echo "No master-only file changes need to be back-merged."
             exit 0
           fi
 
-          pr_number=$(gh pr list --repo "$REPOSITORY" --state open \
-            --base development --head master \
-            --json number --jq '.[0].number // empty')
-
-          if [[ -n "$pr_number" ]]; then
-            pr_url=$(gh pr view "$pr_number" --repo "$REPOSITORY" \
-              --json url --jq '.url')
-            echo "Back-merge PR already exists: $pr_url"
+          open_prs=$(gh pr list --repo "$REPOSITORY" --state open \
+            --base development --head master --limit 100 \
+            --json number,url)
+          pr=$(jq -c '.[0] // empty' <<< "$open_prs")
+          if [[ -n "$pr" ]]; then
+            echo "Back-merge PR already exists: $(jq -r '.url' <<< "$pr")"
             exit 0
           fi
 
           body=$(printf '%s\n' \
-            "The Docker image release $RELEASE_TAG was built, tested," \
-            "and published successfully." \
-            "This PR brings changes present on master but missing from" \
-            "development back into the development branch.")
-          pr_url=$(gh pr create --repo "$REPOSITORY" \
+            "Docker image release $RELEASE_TAG passed tests and was published." \
+            "This PR brings changes present on master but missing from development" \
+            "back into the development branch. Review and merge it when appropriate.")
+          if ! pr_url=$(gh pr create --repo "$REPOSITORY" \
             --base development --head master \
-            --title "Merge master back into development" \
-            --body "$body")
-
+            --title "Merge master back into development" --body "$body"); then
+            echo "::error::Release succeeded, but the back-merge PR could not be opened."
+            echo "Enable Actions PR creation or configure RELEASE_TOKEN with repo write permissions."
+            exit 1
+          fi
           echo "Created back-merge PR: $pr_url"
