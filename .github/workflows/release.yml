@@ -260,7 +260,8 @@ jobs:
 
           # Wait for the exact workflow_dispatch run started above.
           while (( SECONDS < deadline )); do
-            runs=$(gh api "$API/actions/workflows/docker.image.yml/runs" \
+            runs=$(gh api --method GET \
+              "$API/actions/workflows/docker.image.yml/runs" \
               -f event=workflow_dispatch -F per_page=100)
             run=$(jq -c --arg sha "$MERGE_SHA" \
               --arg tag "$RELEASE_TAG" --arg since "$DISPATCHED_AT" '
