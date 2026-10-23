@@ -296,7 +296,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
-          MERGE_SHA: ${{ steps.merge.outputs.sha || steps.validate.outputs.release_sha }}
+          MERGE_SHA: >-
+            ${{ steps.merge.outputs.sha ||
+                steps.validate.outputs.release_sha }}
           RUN_ID: ${{ steps.docker_dispatch.outputs.run_id }}
           DISPATCHED_AT: ${{ steps.docker_dispatch.outputs.dispatched_at }}
         run: |
