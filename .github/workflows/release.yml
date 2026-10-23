@@ -224,6 +224,7 @@ jobs:
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
+
           current_head=$(gh api "$API/git/ref/heads/development" \
             --jq '.object.sha')
           current_base=$(gh api "$API/git/ref/heads/master" \
@@ -260,17 +261,20 @@ jobs:
           fi
 
           err=$(mktemp)
+          merge_sha=
           merge_method=merge
+          result=
           if result=$(gh api --method PUT "$API/pulls/$PR_NUMBER/merge" \
-            -f "sha=$EXPECTED_HEAD" -f "merge_method=$merge_method" 2>"$err"); then
+            -f "sha=$EXPECTED_HEAD" -f "merge_method=$merge_method" \
+            2>"$err"); then
             if [[ $(jq -r '.merged' <<< "$result") != "true" ]]; then
               echo "::error::GitHub did not merge PR #$PR_NUMBER."
               jq -r '.message // "No merge details returned."' <<< "$result"
               exit 1
             fi
+            merge_sha=$(jq -r '.sha' <<< "$result")
           else
-            # Linear-history rules can forbid merge commits even if the repo
-            # allows them globally. Fall back only for that specific failure.
+            # Choose a compatible method if master enforces linear history.
             if grep -Eqi 'linear history|merge method.*not allowed|merge commits.*not allowed' "$err"; then
               repo_settings=$(gh api "$API")
               if [[ $(jq -r '.allow_squash_merge' <<< "$repo_settings") == "true" ]]; then
@@ -279,32 +283,69 @@ jobs:
                 merge_method=rebase
               else
                 cat "$err"
-                echo "::error::No merge method compatible with repository settings is enabled."
+                echo "::error::No merge method compatible with repository rules is enabled."
                 exit 1
               fi
-              echo "Retrying merge using $merge_method, as required by repository merge rules."
+              echo "Retrying with $merge_method to satisfy linear-history rules."
               if result=$(gh api --method PUT "$API/pulls/$PR_NUMBER/merge" \
-                -f "sha=$EXPECTED_HEAD" -f "merge_method=$merge_method" 2>"$err"); then
-                if [[ $(jq -r '.merged' <<< "$result") != "true" ]]; then
+                -f "sha=$EXPECTED_HEAD" -f "merge_method=$merge_method" \
+                2>"$err"); then
+                if [[ $(jq -r '.merged' <<< "$result") == "true" ]]; then
+                  merge_sha=$(jq -r '.sha' <<< "$result")
+                else
                   echo "::error::GitHub did not merge PR #$PR_NUMBER."
                   jq -r '.message // "No merge details returned."' <<< "$result"
                   exit 1
                 fi
-              else
+              fi
+            fi
+
+            # If branch protection requires approvals or checks, ask GitHub
+            # to auto-merge and wait. Human-required reviews are never bypassed.
+            if [[ -z "$merge_sha" ]]; then
+              case "$merge_method" in
+                merge) merge_flag=--merge ;;
+                squash) merge_flag=--squash ;;
+                rebase) merge_flag=--rebase ;;
+                *)
+                  echo "::error::Unsupported merge method: $merge_method"
+                  exit 1
+                  ;;
+              esac
+              if ! gh pr merge "$PR_NUMBER" --repo "$REPOSITORY" \
+                --auto "$merge_flag" 2>"$err"; then
                 cat "$err"
-                echo "::error::The merge is blocked by branch rules or required approval."
-                echo "Resolve the policy requirement, then retry this release."
+                echo "::error::GitHub could not enable auto-merge."
+                echo "Check required approvals/checks and Actions token permissions, then retry."
                 exit 1
               fi
-            else
-              cat "$err"
-              echo "::error::The merge is blocked by branch rules or required approval."
-              echo "If master requires human approval, approve the PR and retry this workflow."
-              exit 1
+
+              deadline=$((SECONDS + 1800))
+              while (( SECONDS < deadline )); do
+                pr=$(gh api "$API/pulls/$PR_NUMBER")
+                if [[ $(jq -r '.merged' <<< "$pr") == "true" ]]; then
+                  merge_sha=$(jq -r '.merge_commit_sha // empty' <<< "$pr")
+                  break
+                fi
+                if [[ $(jq -r '.state' <<< "$pr") != "open" ]]; then
+                  echo "::error::The release PR closed without being merged."
+                  exit 1
+                fi
+                echo "Waiting for required reviews/checks on PR #$PR_NUMBER."
+                sleep 15
+              done
+              if [[ -z "$merge_sha" ]]; then
+                echo "::error::Auto-merge is pending or blocked."
+                echo "Approve the PR or satisfy required checks, then retry this release."
+                exit 1
+              fi
             fi
           fi
 
-          merge_sha=$(jq -r '.sha' <<< "$result")
+          if [[ -z "$merge_sha" ]]; then
+            echo "::error::GitHub returned no merge commit SHA."
+            exit 1
+          fi
           echo "sha=$merge_sha" >> "$GITHUB_OUTPUT"
           echo "Merged PR #$PR_NUMBER as $merge_sha"
 
