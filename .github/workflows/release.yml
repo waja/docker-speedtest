@@ -230,6 +230,7 @@ jobs:
           echo "Created $RELEASE_TAG at $MERGE_SHA"
 
       - name: Start Docker image CI for the release tag
+        id: docker_dispatch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
@@ -237,7 +238,100 @@ jobs:
         run: |
           set -euo pipefail
           # GITHUB_TOKEN tag creation does not trigger push workflows.
-          # workflow_dispatch explicitly starts the test-and-publish pipeline.
+          # Explicit dispatch starts the test-and-publish pipeline.
+          dispatched_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
           gh workflow run docker.image.yml \
             --repo "$REPOSITORY" --ref "$RELEASE_TAG"
+          echo "dispatched_at=$dispatched_at" >> "$GITHUB_OUTPUT"
           echo "Started Docker Image CI for $RELEASE_TAG"
+
+      - name: Wait for Docker build and image publication
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          MERGE_SHA: ${{ steps.merge.outputs.sha }}
+          DISPATCHED_AT: ${{ steps.docker_dispatch.outputs.dispatched_at }}
+        run: |
+          set -euo pipefail
+          API="repos/$REPOSITORY"
+          deadline=$((SECONDS + 5400))
+
+          # Wait for the exact workflow_dispatch run started above.
+          while (( SECONDS < deadline )); do
+            runs=$(gh api "$API/actions/workflows/docker.image.yml/runs?event=workflow_dispatch&per_page=100")
+            run=$(jq -c --arg sha "$MERGE_SHA" \
+              --arg tag "$RELEASE_TAG" --arg since "$DISPATCHED_AT" '
+                [.workflow_runs[]
+                  | select(
+                      .head_sha == $sha
+                      and .head_branch == $tag
+                      and .created_at >= $since
+                    )]
+                | sort_by(.created_at)
+                | last // empty
+              ' <<< "$runs")
+
+            if [[ -n "$run" ]]; then
+              status=$(jq -r '.status' <<< "$run")
+              conclusion=$(jq -r '.conclusion // empty' <<< "$run")
+              run_id=$(jq -r '.id' <<< "$run")
+              run_url=$(jq -r '.html_url' <<< "$run")
+
+              if [[ "$status" == "completed" ]]; then
+                if [[ "$conclusion" != "success" ]]; then
+                  echo "::error::Docker Image CI run $run_id ended: $conclusion"
+                  echo "See $run_url"
+                  exit 1
+                fi
+                echo "Docker build, tests and publication succeeded."
+                echo "Workflow run: $run_url"
+                exit 0
+              fi
+
+              echo "Waiting for Docker Image CI run $run_id ($status)."
+            else
+              echo "Waiting for Docker Image CI run for $RELEASE_TAG."
+            fi
+            sleep 30
+          done
+
+          echo "::error::Timed out waiting for Docker build and publication."
+          exit 1
+
+      - name: Open back-merge PR if master has changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          API="repos/$REPOSITORY"
+
+          # Compare in PR direction. The diff excludes the release merge
+          # commit itself when it contains no master-only file changes.
+          comparison=$(gh api "$API/compare/development...master")
+          changed_files=$(jq '.files | length' <<< "$comparison")
+
+          if [[ "$changed_files" == "0" ]]; then
+            echo "No master-only file changes to back-merge."
+            exit 0
+          fi
+
+          pr_number=$(gh pr list --repo "$REPOSITORY" --state open \
+            --base development --head master \
+            --json number --jq '.[0].number // empty')
+
+          if [[ -n "$pr_number" ]]; then
+            pr_url=$(gh pr view "$pr_number" --repo "$REPOSITORY" \
+              --json url --jq '.url')
+            echo "Back-merge PR already exists: $pr_url"
+            exit 0
+          fi
+
+          pr_url=$(gh pr create --repo "$REPOSITORY" \
+            --base development --head master \
+            --title "Merge master back into development" \
+            --body "The Docker image release `$RELEASE_TAG` was built, tested, and published successfully. This PR brings changes present on `master` but missing from `development` back into the development branch.")
+
+          echo "Created back-merge PR: $pr_url"
