@@ -48,7 +48,7 @@ jobs:
 
           echo "Validated tag: $RELEASE_TAG"
 
-      - name: Check branches and existing pull requests
+      - name: Check branches and prepare pull request
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -61,21 +61,19 @@ jobs:
           development_sha=$(gh api "$API/git/ref/heads/development" \
             --jq '.object.sha')
 
-          if [[ "$master_sha" == "$development_sha" ]]; then
-            echo "::error::development and master are already identical."
+          comparison=$(gh api "$API/compare/master...development")
+          ahead=$(jq -r '.ahead_by' <<< "$comparison")
+          behind=$(jq -r '.behind_by' <<< "$comparison")
+
+          # development must contain at least one commit not on master.
+          # master-only commits are allowed; the PR mergeability check below
+          # determines whether the two branch histories can be combined.
+          if [[ "$ahead" == "0" ]]; then
+            echo "::error::development has no new commits to release."
             exit 1
           fi
 
-          comparison=$(gh api "$API/compare/master...development")
-          status=$(jq -r '.status' <<< "$comparison")
-          ahead=$(jq -r '.ahead_by' <<< "$comparison")
-          behind=$(jq -r '.behind_by' <<< "$comparison")
-          if [[ "$status" != "ahead" || "$behind" != "0" || \
-                "$ahead" == "0" ]]; then
-            echo "::error::Branches are not in a releasable state."
-            echo "status=$status, ahead=$ahead, behind=$behind"
-            exit 1
-          fi
+          echo "development ahead by $ahead; master ahead by $behind commits."
 
           pr_number=$(gh pr list --repo "$REPOSITORY" --state open \
             --base master --head development \
@@ -95,22 +93,100 @@ jobs:
             echo "development_sha=$development_sha"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Merge release pull request
+      - name: Wait for CI on development
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          EXPECTED_HEAD: ${{ steps.pr.outputs.development_sha }}
+        run: |
+          set -euo pipefail
+
+          # A workflow_dispatch-created PR does not reliably trigger a new
+          # pull_request run when GITHUB_TOKEN created it. Gate on the
+          # Docker Image CI run for this exact development commit instead.
+          deadline=$((SECONDS + 1800))
+          while (( SECONDS < deadline )); do
+            runs=$(gh run list --repo "$REPOSITORY" \
+              --workflow docker.image.yml --branch development \
+              --commit "$EXPECTED_HEAD" --limit 20 \
+              --json databaseId,event,status,conclusion,headSha)
+            run=$(jq -c --arg sha "$EXPECTED_HEAD" \
+              '[.[] | select(.event == "push" and .headSha == $sha)]\
+               | .[0] // empty' <<< "$runs")
+
+            if [[ -n "$run" ]]; then
+              status=$(jq -r '.status' <<< "$run")
+              conclusion=$(jq -r '.conclusion // empty' <<< "$run")
+              run_id=$(jq -r '.databaseId' <<< "$run")
+
+              if [[ "$status" == "completed" ]]; then
+                if [[ "$conclusion" != "success" ]]; then
+                  echo "::error::Docker Image CI run $run_id ended: $conclusion"
+                  exit 1
+                fi
+                echo "Docker Image CI passed for $EXPECTED_HEAD."
+                exit 0
+              fi
+
+              echo "Waiting for Docker Image CI run $run_id ($status)."
+            else
+              echo "Waiting for Docker Image CI run for $EXPECTED_HEAD."
+            fi
+            sleep 10
+          done
+
+          echo "::error::Timed out waiting for Docker Image CI (30 minutes)."
+          exit 1
+
+      - name: Check mergeability and merge pull request
         id: merge
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           EXPECTED_HEAD: ${{ steps.pr.outputs.development_sha }}
+          EXPECTED_BASE: ${{ steps.pr.outputs.master_sha }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
 
-          current_head=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" \
-            --json headRefOid --jq '.headRefOid')
-          if [[ "$current_head" != "$EXPECTED_HEAD" ]]; then
-            echo "::error::development changed after validation."
-            echo "Restart the release workflow."
+          current_head=$(gh api "$API/git/ref/heads/development" \
+            --jq '.object.sha')
+          current_base=$(gh api "$API/git/ref/heads/master" \
+            --jq '.object.sha')
+          if [[ "$current_head" != "$EXPECTED_HEAD" || \
+                "$current_base" != "$EXPECTED_BASE" ]]; then
+            echo "::error::development or master changed during release."
+            echo "Restart the workflow to release the updated branch state."
+            exit 1
+          fi
+
+          # GitHub calculates mergeability asynchronously after PR creation.
+          mergeable="unknown"
+          for attempt in {1..24}; do
+            pr=$(gh api "$API/pulls/$PR_NUMBER")
+            pr_head=$(jq -r '.head.sha' <<< "$pr")
+            pr_base=$(jq -r '.base.sha' <<< "$pr")
+            mergeable=$(jq -r '.mergeable // "unknown"' <<< "$pr")
+
+            if [[ "$pr_head" != "$EXPECTED_HEAD" || \
+                  "$pr_base" != "$EXPECTED_BASE" ]]; then
+              echo "::error::The pull request head or base changed."
+              exit 1
+            fi
+            if [[ "$mergeable" == "true" ]]; then
+              break
+            fi
+            if [[ "$mergeable" == "false" ]]; then
+              echo "::error::The branches have merge conflicts."
+              echo "Resolve conflicts and restart the release workflow."
+              exit 1
+            fi
+            sleep 5
+          done
+
+          if [[ "$mergeable" != "true" ]]; then
+            echo "::error::GitHub could not determine PR mergeability."
             exit 1
           fi
 
@@ -136,10 +212,9 @@ jobs:
           set -euo pipefail
           API="repos/$REPOSITORY"
 
-          # Re-check that the requested tag is still unused.
+          # Never overwrite an existing tag.
           if gh api "$API/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "::error::Tag '$RELEASE_TAG' was created concurrently."
-            echo "Refusing to overwrite it."
+            echo "::error::Tag '$RELEASE_TAG' already exists."
             exit 1
           fi
 
