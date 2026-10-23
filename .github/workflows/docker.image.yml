@@ -1,7 +1,15 @@
+---
 name: Docker Image CI
 
+# checkov:skip=CKV_GHA_7: The release workflow needs publish=false test dispatches.
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish images after tests (false runs tests only)"
+        required: false
+        type: boolean
+        default: true
   push:
     branches:
       - $default-branch
@@ -13,6 +21,11 @@ on:
   pull_request:
   schedule:
     - cron: "43 10 * * 4"
+
+# Prevent two runs for the same branch or tag from publishing concurrently.
+concurrency:
+  group: docker-image-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   IMAGE_NAME: speedtest
@@ -400,7 +413,7 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
           tags: |
             ${{ steps.prep.outputs.tags }}
           cache-from: type=local,src=/tmp/.buildx-cache
