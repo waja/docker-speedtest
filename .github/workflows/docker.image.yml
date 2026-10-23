@@ -59,8 +59,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
-        with:
           # super-linter needs the full git history to get the
           # list of files that changed across commits
           ref: ${{ inputs.source_ref || github.ref }}
