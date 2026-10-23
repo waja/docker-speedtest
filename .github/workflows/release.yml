@@ -318,26 +318,36 @@ jobs:
               esac
               if ! gh pr merge "$PR_NUMBER" --repo "$REPOSITORY" \
                 --auto "$merge_flag" 2>"$err"; then
-                cat "$err"
-                echo "::error::GitHub could not enable auto-merge."
-                echo "Check required approvals/checks and Actions token permissions, then retry."
-                exit 1
-              fi
-
-              deadline=$((SECONDS + 1800))
-              while (( SECONDS < deadline )); do
+                # A maintainer may have merged the PR between the API attempt
+                # and this fallback. Accept that only after verifying GitHub's
+                # recorded merge state and commit SHA.
                 pr=$(gh api "$API/pulls/$PR_NUMBER")
                 if [[ $(jq -r '.merged' <<< "$pr") == "true" ]]; then
                   merge_sha=$(jq -r '.merge_commit_sha // empty' <<< "$pr")
-                  break
-                fi
-                if [[ $(jq -r '.state' <<< "$pr") != "open" ]]; then
-                  echo "::error::The release PR closed without being merged."
+                else
+                  cat "$err"
+                  echo "::error::GitHub could not enable auto-merge."
+                  echo "Check required approvals/checks and Actions token permissions, then retry."
                   exit 1
                 fi
-                echo "Waiting for required reviews/checks on PR #$PR_NUMBER."
-                sleep 15
-              done
+              fi
+
+              if [[ -z "$merge_sha" ]]; then
+                deadline=$((SECONDS + 1800))
+                while (( SECONDS < deadline )); do
+                  pr=$(gh api "$API/pulls/$PR_NUMBER")
+                  if [[ $(jq -r '.merged' <<< "$pr") == "true" ]]; then
+                    merge_sha=$(jq -r '.merge_commit_sha // empty' <<< "$pr")
+                    break
+                  fi
+                  if [[ $(jq -r '.state' <<< "$pr") != "open" ]]; then
+                    echo "::error::The release PR closed without being merged."
+                    exit 1
+                  fi
+                  echo "Waiting for required reviews/checks on PR #$PR_NUMBER."
+                  sleep 15
+                done
+              fi
               if [[ -z "$merge_sha" ]]; then
                 echo "::error::Auto-merge is pending or blocked."
                 echo "Approve the PR or satisfy required checks, then retry this release."
