@@ -134,20 +134,6 @@ jobs:
               | last // empty
             ' <<< "$merged_prs")
 
-            if [[ -z "$merged_pr" ]]; then
-              # Older workflow versions used a generic title. Recover the
-              # latest such merge only when development has no unmerged commits.
-              comparison=$(gh api "$API/compare/master...development")
-              ahead=$(jq -r '.ahead_by' <<< "$comparison")
-              if [[ "$ahead" == "0" ]]; then
-                merged_pr=$(jq -c '
-                  [.[] | select(.title == "Release: development to master")]
-                  | sort_by(.mergedAt)
-                  | last // empty
-                ' <<< "$merged_prs")
-              fi
-            fi
-
             if [[ -n "$merged_pr" ]]; then
               release_sha=$(jq -r '.mergeCommit.oid // empty' <<< "$merged_pr")
               if [[ -z "$release_sha" ]]; then
@@ -189,7 +175,7 @@ jobs:
 
           if [[ "$ahead" == "0" ]]; then
             echo "::error::development has no commits to release."
-            echo "If a previous attempt merged this release, retry after the tag is restored or inspect master."
+            echo "If this release was already merged, its PR title must include the requested tag to resume safely."
             exit 1
           fi
           echo "development ahead by $ahead; master ahead by $behind commits."
