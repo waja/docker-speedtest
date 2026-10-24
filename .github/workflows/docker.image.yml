@@ -90,7 +90,7 @@ jobs:
       - name: Checkout workflow tools
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.sha || github.event.repository.default_branch }}
           path: .workflow-tools
           fetch-depth: 0
 
@@ -142,6 +142,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
+      - name: Checkout workflow tools
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.sha || github.event.repository.default_branch }}
+          path: .workflow-tools
           fetch-depth: 0
 
       - name: Prepare build commit metadata
@@ -388,7 +394,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
+          vcs_branch="$(bash /tmp/source/resolve-vcs-branch.sh)"
 
           {
             echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
