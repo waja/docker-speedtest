@@ -9,6 +9,11 @@ on:
         description: "Release tag, e.g. 2.1.3-35"
         required: true
         type: string
+      allow_tag_replacement:
+        description: "Allow republishing this tag from a different commit (overwrites published tag contents)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   actions: write
@@ -490,6 +495,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+          ALLOW_TAG_REPLACEMENT: ${{ inputs.allow_tag_replacement }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
