@@ -90,7 +90,7 @@ jobs:
       - name: Checkout workflow tools
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
           path: .workflow-tools
           fetch-depth: 0
 
@@ -101,10 +101,15 @@ jobs:
           SOURCE_REF_INPUT: ${{ inputs.source_ref }}
           HEAD_REF_INPUT: ${{ github.head_ref }}
           REF_NAME_INPUT: ${{ github.ref_name }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
-          vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            vcs_branch="$HEAD_REF_INPUT"
+          else
+            vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
+          fi
 
           {
             echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
@@ -146,7 +151,7 @@ jobs:
       - name: Checkout workflow tools
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
           path: .workflow-tools
           fetch-depth: 0
 
@@ -157,10 +162,15 @@ jobs:
           SOURCE_REF_INPUT: ${{ inputs.source_ref }}
           HEAD_REF_INPUT: ${{ github.head_ref }}
           REF_NAME_INPUT: ${{ github.ref_name }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
-          vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            vcs_branch="$HEAD_REF_INPUT"
+          else
+            vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
+          fi
 
           {
             echo "vcs_sha=$(git rev-parse HEAD)"
@@ -391,10 +401,15 @@ jobs:
           SOURCE_REF_INPUT: ${{ inputs.source_ref }}
           HEAD_REF_INPUT: ${{ github.head_ref }}
           REF_NAME_INPUT: ${{ github.ref_name }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
-          vcs_branch="$(bash /tmp/source/resolve-vcs-branch.sh)"
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            vcs_branch="$HEAD_REF_INPUT"
+          else
+            vcs_branch="$(bash /tmp/source/resolve-vcs-branch.sh)"
+          fi
 
           {
             echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
