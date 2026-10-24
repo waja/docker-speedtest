@@ -92,7 +92,7 @@ jobs:
         id: metadata
         env:
           BUILD_VERSION_INPUT: ${{ inputs.image_version }}
-          VCS_BRANCH_INPUT: ${{ inputs.image_version || github.head_ref || github.ref_name }}
+          VCS_BRANCH_INPUT: ${{ inputs.image_version || github.head_ref || inputs.source_ref || github.ref_name }}
         run: |
           set -euo pipefail
           {
@@ -131,6 +131,10 @@ jobs:
           ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 0
 
+      - name: Prepare build commit metadata
+        id: build_metadata
+        run: echo "vcs_ref=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v4
@@ -152,7 +156,7 @@ jobs:
           build-args: |
             BUILD_DATE=${{ needs.shiftleft.outputs.build_date }}
             BUILD_VERSION=${{ needs.shiftleft.outputs.build_version }}
-            VCS_REF=${{ needs.shiftleft.outputs.vcs_ref }}
+            VCS_REF=${{ steps.build_metadata.outputs.vcs_ref }}
             VCS_URL=${{ needs.shiftleft.outputs.vcs_url }}
             VCS_BRANCH=${{ needs.shiftleft.outputs.vcs_branch }}
       - name: Upload artifact
@@ -329,7 +333,7 @@ jobs:
         id: metadata
         env:
           BUILD_VERSION_INPUT: ${{ inputs.image_version }}
-          VCS_BRANCH_INPUT: ${{ inputs.image_version || github.head_ref || github.ref_name }}
+          VCS_BRANCH_INPUT: ${{ inputs.image_version || github.head_ref || inputs.source_ref || github.ref_name }}
         run: |
           set -euo pipefail
           {
