@@ -92,7 +92,7 @@ jobs:
         id: metadata
         env:
           BUILD_VERSION_INPUT: ${{ inputs.image_version }}
-          VCS_BRANCH_INPUT: ${{ inputs.image_version || github.head_ref || inputs.source_ref || github.ref_name }}
+          VCS_BRANCH_INPUT: ${{ inputs.image_version || github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
           {
@@ -133,7 +133,14 @@ jobs:
 
       - name: Prepare build commit metadata
         id: build_metadata
-        run: echo "vcs_ref=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+        env:
+          BUILD_VERSION_INPUT: ${{ inputs.image_version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "vcs_ref=$(git rev-parse --short HEAD)"
+            echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         id: buildx
@@ -155,7 +162,7 @@ jobs:
           platforms: linux/amd64
           build-args: |
             BUILD_DATE=${{ needs.shiftleft.outputs.build_date }}
-            BUILD_VERSION=${{ needs.shiftleft.outputs.build_version }}
+            BUILD_VERSION=${{ steps.build_metadata.outputs.build_version }}
             VCS_REF=${{ steps.build_metadata.outputs.vcs_ref }}
             VCS_URL=${{ needs.shiftleft.outputs.vcs_url }}
             VCS_BRANCH=${{ needs.shiftleft.outputs.vcs_branch }}
@@ -333,7 +340,7 @@ jobs:
         id: metadata
         env:
           BUILD_VERSION_INPUT: ${{ inputs.image_version }}
-          VCS_BRANCH_INPUT: ${{ inputs.image_version || github.head_ref || inputs.source_ref || github.ref_name }}
+          VCS_BRANCH_INPUT: ${{ inputs.image_version || github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
           {
