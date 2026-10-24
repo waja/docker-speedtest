@@ -27,6 +27,11 @@ on:
         required: false
         type: string
         default: ""
+      replacement:
+        description: "Republish an existing release tag without moving latest"
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
       - $default-branch
@@ -425,6 +430,7 @@ jobs:
           SOURCE_REF_INPUT: ${{ inputs.source_ref }}
           IMAGE_VERSION_INPUT: ${{ inputs.image_version }}
           PUBLISH_INPUT: ${{ inputs.publish }}
+          REPLACEMENT_INPUT: ${{ inputs.replacement }}
           QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
         run: |
@@ -461,21 +467,21 @@ jobs:
           TAGS_INT="$TAGS"
           TAGS=""
           if [ "$DOCKERHUB_USERNAME" != '' ] && [ "$DOCKERHUB_TOKEN" != '' ]; then
-            if [ "$REALEASE_TAG" = "true" ]; then
+            if [ "$REALEASE_TAG" = "true" ] && [[ "${{ inputs.replacement }}" != "true" ]]; then
               TAGS="$TAGS_INT,${DOCKER_IMAGE}:latest"
             else
               TAGS="$TAGS_INT"
             fi
           fi
           if [ "$GITHUB_TOKEN" != '' ]; then
-            if [ "$REALEASE_TAG" = "true" ]; then
+            if [ "$REALEASE_TAG" = "true" ] && [[ "${{ inputs.replacement }}" != "true" ]]; then
               TAGS="$TAGS,ghcr.io/$TAGS_INT,ghcr.io/${DOCKER_IMAGE}:latest"
             else
               TAGS="$TAGS,ghcr.io/$TAGS_INT"
             fi
           fi
           if [ "$QUAY_USERNAME" != '' ] && [ "$QUAY_TOKEN" != '' ]; then
-            if [ "$REALEASE_TAG" = "true" ]; then
+            if [ "$REALEASE_TAG" = "true" ] && [[ "${{ inputs.replacement }}" != "true" ]]; then
               TAGS="$TAGS,quay.io/$TAGS_INT,quay.io/${DOCKER_IMAGE}:latest"
             else
               TAGS="$TAGS,quay.io/$TAGS_INT"
