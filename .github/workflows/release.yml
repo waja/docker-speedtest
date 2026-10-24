@@ -9,6 +9,11 @@ on:
         description: "Release tag, e.g. 2.1.3-35"
         required: true
         type: string
+      allow_tag_replacement:
+        description: "Allow republishing this tag from a different commit (overwrites published tag contents)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   actions: write
@@ -394,10 +399,11 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+          ALLOW_TAG_REPLACEMENT: ${{ inputs.allow_tag_replacement }}
         run: |
           set -euo pipefail
           bash .github/scripts/check-release-image-history.sh \
-            "repos/$REPOSITORY" "$RELEASE_TAG" "$RELEASE_SHA"
+            "repos/$REPOSITORY" "$RELEASE_TAG" "$RELEASE_SHA" "$ALLOW_TAG_REPLACEMENT"
 
       - name: Start or reuse tests for the resulting merge commit
         id: test_dispatch
@@ -490,6 +496,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+          ALLOW_TAG_REPLACEMENT: ${{ inputs.allow_tag_replacement }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
@@ -500,7 +507,7 @@ jobs:
           # Check tag history before any dispatch, then locate an existing
           # publication run (including older tag-ref workflow runs).
           bash .github/scripts/check-release-image-history.sh \
-            "$API" "$RELEASE_TAG" "$RELEASE_SHA"
+            "$API" "$RELEASE_TAG" "$RELEASE_SHA" "$ALLOW_TAG_REPLACEMENT"
           run_lines=$(gh api --paginate --method GET \
             "$API/actions/workflows/docker.image.yml/runs" \
             -F per_page=100 \

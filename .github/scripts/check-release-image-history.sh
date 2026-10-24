@@ -6,6 +6,7 @@ set -euo pipefail
 API="${1:?API path required, e.g. repos/owner/repo}"
 RELEASE_TAG="${2:?Release tag required}"
 RELEASE_SHA="${3:?Release commit SHA required}"
+ALLOW_TAG_REPLACEMENT="${4:-false}"
 PUBLISH_PREFIX="Docker Image CI release-publish-${RELEASE_TAG}-"
 
 run_lines=$(gh api --paginate --method GET \
@@ -36,6 +37,11 @@ latest_sha=$(jq -r --arg prefix "$PUBLISH_PREFIX" '
 ' <<<"$latest")
 
 if [[ "$latest_sha" != "$RELEASE_SHA" ]]; then
+	if [[ "$ALLOW_TAG_REPLACEMENT" == "true" ]]; then
+		echo "::warning::Explicit override enabled: $RELEASE_TAG will be republished from a different commit."
+		jq '{id,head_sha,head_branch,display_title,status,conclusion}' <<<"$latest"
+		exit 0
+	fi
 	echo "::error::The latest publication for $RELEASE_TAG uses another commit."
 	echo "Refusing to replace an image that may already be published."
 	jq '{id,head_sha,head_branch,display_title,status,conclusion}' <<<"$latest"
