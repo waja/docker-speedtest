@@ -497,6 +497,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           ALLOW_TAG_REPLACEMENT: ${{ inputs.allow_tag_replacement }}
+          ALLOW_TAG_REPLACEMENT: ${{ inputs.allow_tag_replacement }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
@@ -507,7 +508,7 @@ jobs:
           # Check tag history before any dispatch, then locate an existing
           # publication run (including older tag-ref workflow runs).
           bash .github/scripts/check-release-image-history.sh \
-            "$API" "$RELEASE_TAG" "$RELEASE_SHA"
+            "$API" "$RELEASE_TAG" "$RELEASE_SHA" "$ALLOW_TAG_REPLACEMENT"
           run_lines=$(gh api --paginate --method GET \
             "$API/actions/workflows/docker.image.yml/runs" \
             -F per_page=100 \
