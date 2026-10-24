@@ -10,7 +10,7 @@ on:
         required: true
         type: string
       allow_tag_replacement:
-        description: "Allow republishing this tag from a different commit (overwrites published tag contents)"
+        description: "Replace this tag with the current master commit and republish it (does not update latest)"
         required: false
         type: boolean
         default: false
@@ -117,10 +117,17 @@ jobs:
           tag_file=$(mktemp)
           tag_error=$(mktemp)
           if gh api "$API/git/ref/tags/$RELEASE_TAG" >"$tag_file" 2>"$tag_error"; then
-            release_sha=$(resolve_tag_commit "$(cat "$tag_file")")
-            assert_on_master_history "$release_sha"
-            mode=tagged
-            echo "Existing tag $RELEASE_TAG resolves to $release_sha."
+            if [[ "${{ inputs.allow_tag_replacement }}" == "true" ]]; then
+              release_sha=$(gh api "$API/git/ref/heads/master" --jq '.object.sha')
+              assert_on_master_history "$release_sha"
+              mode=replace_tagged
+              echo "Replacement requested: $RELEASE_TAG will use current master commit $release_sha."
+            else
+              release_sha=$(resolve_tag_commit "$(cat "$tag_file")")
+              assert_on_master_history "$release_sha"
+              mode=tagged
+              echo "Existing tag $RELEASE_TAG resolves to $release_sha."
+            fi
           else
             # Only a genuine 404 means the tag is absent. Auth, API and
             # network failures must stop before a merge can occur.
@@ -463,7 +470,7 @@ jobs:
           bash .github/scripts/wait-for-workflow-run.sh \
             "$API" "$RUN_ID" "$DISPLAY_TITLE" "$DISPATCHED_AT" 5400
 
-      - name: Create tag only after merge-commit tests pass
+      - name: Create or replace tag only after merge-commit tests pass
         if: steps.validate.outputs.mode != 'tagged'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
@@ -501,7 +508,11 @@ jobs:
           set -euo pipefail
           API="repos/$REPOSITORY"
           DEFAULT_BRANCH=$(gh api "$API" --jq '.default_branch')
-          PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA"
+          if [[ "$ALLOW_TAG_REPLACEMENT" == "true" ]]; then
+            PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA-replacement-${GITHUB_RUN_ID}"
+          else
+            PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA"
+          fi
           PUBLISH_TITLE="Docker Image CI $PUBLISH_ID"
 
           # Check tag history before any dispatch, then locate an existing
@@ -549,7 +560,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           RUN_ID: ${{ steps.docker_dispatch.outputs.run_id }}
-          DISPLAY_TITLE: Docker Image CI release-publish-${{ inputs.tag }}-${{ steps.release_commit.outputs.sha }}
+          DISPLAY_TITLE: Docker Image CI release-publish-${{ inputs.tag }}-${{ steps.release_commit.outputs.sha }}${{ inputs.allow_tag_replacement && format('-replacement-{0}', github.run_id) || '' }}
           DISPATCHED_AT: ${{ steps.docker_dispatch.outputs.dispatched_at }}
         run: |
           set -euo pipefail
