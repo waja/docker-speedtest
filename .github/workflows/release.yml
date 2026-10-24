@@ -399,10 +399,11 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+          ALLOW_TAG_REPLACEMENT: ${{ inputs.allow_tag_replacement }}
         run: |
           set -euo pipefail
           bash .github/scripts/check-release-image-history.sh \
-            "repos/$REPOSITORY" "$RELEASE_TAG" "$RELEASE_SHA"
+            "repos/$REPOSITORY" "$RELEASE_TAG" "$RELEASE_SHA" "$ALLOW_TAG_REPLACEMENT"
 
       - name: Start or reuse tests for the resulting merge commit
         id: test_dispatch
