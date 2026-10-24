@@ -361,7 +361,9 @@ jobs:
       - name: Restore tested source tree
         run: |
           set -euo pipefail
-          git clone /tmp/source/source.bundle .
+          git init .
+          git fetch /tmp/source/source.bundle HEAD
+          git checkout --detach FETCH_HEAD
           test "$(git rev-parse HEAD)" = "${{ needs.test-build.outputs.tested_sha }}"
 
       - name: Prepare image metadata
