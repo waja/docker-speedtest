@@ -498,7 +498,7 @@ jobs:
                 ((.head_branch == $tag and (.event == "push" or .event == "workflow_dispatch")) or
                  ((.display_title // "") | startswith("Docker Image CI release-publish-" + $tag + "-"))))
                 | (if ((.display_title // "") | startswith("Docker Image CI release-publish-" + $tag + "-"))
-                   then .display_title["Docker Image CI release-publish-".length + ($tag | length) + 1:][:40]
+                   then .display_title[("Docker Image CI release-publish-" | length) + ($tag | length) + 1:][:40]
                    else .head_sha end)]
               | any(. != $sha) ' <<< "$prior_runs")
             if [[ "$prior_other_sha" == "true" ]]; then
