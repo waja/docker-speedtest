@@ -512,16 +512,6 @@ jobs:
             fi
           fi
 
-      - name: Download artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ env.IMAGE_NAME }}-${{ github.run_number }}
-          path: /tmp
-
-      - name: Load image from test job
-        run: |
-          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_number }}.tar
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
         with:
