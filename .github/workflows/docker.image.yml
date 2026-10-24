@@ -27,6 +27,11 @@ on:
         required: false
         type: string
         default: ""
+      replacement:
+        description: "Republish an existing release tag without moving latest"
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
       - $default-branch
@@ -425,11 +430,30 @@ jobs:
           SOURCE_REF_INPUT: ${{ inputs.source_ref }}
           IMAGE_VERSION_INPUT: ${{ inputs.image_version }}
           PUBLISH_INPUT: ${{ inputs.publish }}
+          REPLACEMENT_INPUT: ${{ inputs.replacement }}
+          EVENT_NAME_INPUT: ${{ github.event_name }}
+          EVENT_REF_INPUT: ${{ github.ref }}
+          EVENT_BEFORE_INPUT: ${{ github.event.before }}
           QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
         run: |
           USER="${GITHUB_REPOSITORY_OWNER}"
-          IMAGE_NAME="$(echo '${{ github.repository }}' | awk -F '/' '{print $2}' | sed  s/docker-//)"
+          case "$REPLACEMENT_INPUT" in
+            true|false|"") ;;
+            *) echo "::error::Invalid replacement input."; exit 1 ;;
+          esac
+          replacement_effective=false
+          if [[ "$REPLACEMENT_INPUT" == "true" ]]; then
+            replacement_effective=true
+          elif [[ "$EVENT_NAME_INPUT" == "push" &&
+                  "$EVENT_REF_INPUT" == refs/tags/* &&
+                  -n "$EVENT_BEFORE_INPUT" &&
+                  "$EVENT_BEFORE_INPUT" != "0000000000000000000000000000000000000000" ]]; then
+            # A force-update of an existing tag is a replacement, not a new
+            # release. The release workflow performs the explicit publication.
+            replacement_effective=true
+          fi
+          IMAGE_NAME="$(echo "$GITHUB_REPOSITORY" | awk -F '/' '{print $2}' | sed  s/docker-//)"
           DOCKER_IMAGE="${USER}/${IMAGE_NAME}"
           VERSION=edge
           # running on a tag
@@ -461,21 +485,21 @@ jobs:
           TAGS_INT="$TAGS"
           TAGS=""
           if [ "$DOCKERHUB_USERNAME" != '' ] && [ "$DOCKERHUB_TOKEN" != '' ]; then
-            if [ "$REALEASE_TAG" = "true" ]; then
+            if [ "$REALEASE_TAG" = "true" ] && [[ "$replacement_effective" != "true" ]]; then
               TAGS="$TAGS_INT,${DOCKER_IMAGE}:latest"
             else
               TAGS="$TAGS_INT"
             fi
           fi
           if [ "$GITHUB_TOKEN" != '' ]; then
-            if [ "$REALEASE_TAG" = "true" ]; then
+            if [ "$REALEASE_TAG" = "true" ] && [[ "$replacement_effective" != "true" ]]; then
               TAGS="$TAGS,ghcr.io/$TAGS_INT,ghcr.io/${DOCKER_IMAGE}:latest"
             else
               TAGS="$TAGS,ghcr.io/$TAGS_INT"
             fi
           fi
           if [ "$QUAY_USERNAME" != '' ] && [ "$QUAY_TOKEN" != '' ]; then
-            if [ "$REALEASE_TAG" = "true" ]; then
+            if [ "$REALEASE_TAG" = "true" ] && [[ "$replacement_effective" != "true" ]]; then
               TAGS="$TAGS,quay.io/$TAGS_INT,quay.io/${DOCKER_IMAGE}:latest"
             else
               TAGS="$TAGS,quay.io/$TAGS_INT"
@@ -483,10 +507,16 @@ jobs:
           fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
           echo "skip_publish=false" >> "$GITHUB_OUTPUT"
+          if [[ "$EVENT_NAME_INPUT" == "push" &&
+                "$EVENT_REF_INPUT" == refs/tags/* &&
+                "$replacement_effective" == "true" ]]; then
+            echo "::notice::Existing tag was force-updated; leaving publication to the release workflow."
+            echo "skip_publish=true" >> "$GITHUB_OUTPUT"
+          fi
 
           # Workflow-level concurrency serializes runs for this ref. A second
           # run must also avoid publishing if an earlier run already succeeded.
-          if [[ "$PUBLISH_INPUT" != "false" && \
+          if [[ "$PUBLISH_INPUT" != "false" && "$replacement_effective" != "true" && \
                 "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$ ]]; then
             source_sha="${SOURCE_REF_INPUT:-$GITHUB_SHA}"
             publish_title="Docker Image CI release-publish-$VERSION-$source_sha"
