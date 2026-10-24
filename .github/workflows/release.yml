@@ -518,11 +518,7 @@ jobs:
           set -euo pipefail
           API="repos/$REPOSITORY"
           DEFAULT_BRANCH=$(gh api "$API" --jq '.default_branch')
-          if [[ "$ALLOW_TAG_REPLACEMENT" == "true" ]]; then
-            PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA-replacement-${GITHUB_RUN_ID}"
-          else
-            PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA"
-          fi
+          PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA"
           PUBLISH_TITLE="Docker Image CI $PUBLISH_ID"
 
           # Check tag history before any dispatch, then locate an existing
