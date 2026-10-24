@@ -98,24 +98,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          vcs_branch=""
-          if [[ "$SOURCE_REF_INPUT" == refs/heads/* ]]; then
-            vcs_branch="${SOURCE_REF_INPUT#refs/heads/}"
-          elif [[ "$SOURCE_REF_INPUT" == refs/remotes/origin/* ]]; then
-            vcs_branch="${SOURCE_REF_INPUT#refs/remotes/origin/}"
-          elif [[ -n "$SOURCE_REF_INPUT" ]]; then
-            # An unqualified ref is only a branch when it resolves uniquely
-            # to a branch, not when a tag with the same name also exists.
-            if [[ "$SOURCE_REF_INPUT" != refs/* ]] &&
-              git show-ref --verify --quiet "refs/remotes/origin/$SOURCE_REF_INPUT" &&
-              ! git show-ref --verify --quiet "refs/tags/$SOURCE_REF_INPUT"; then
-              vcs_branch="$SOURCE_REF_INPUT"
-            fi
-          elif [[ "$GITHUB_REF" == refs/heads/* ]]; then
-            vcs_branch="${GITHUB_REF#refs/heads/}"
-          elif [[ -n "$HEAD_REF_INPUT" ]]; then
-            vcs_branch="$HEAD_REF_INPUT"
-          fi
+          vcs_branch="$(bash .github/scripts/resolve-vcs-branch.sh)"
 
           {
             echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
@@ -165,24 +148,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          vcs_branch=""
-          if [[ "$SOURCE_REF_INPUT" == refs/heads/* ]]; then
-            vcs_branch="${SOURCE_REF_INPUT#refs/heads/}"
-          elif [[ "$SOURCE_REF_INPUT" == refs/remotes/origin/* ]]; then
-            vcs_branch="${SOURCE_REF_INPUT#refs/remotes/origin/}"
-          elif [[ -n "$SOURCE_REF_INPUT" ]]; then
-            # An unqualified ref is only a branch when it resolves uniquely
-            # to a branch, not when a tag with the same name also exists.
-            if [[ "$SOURCE_REF_INPUT" != refs/* ]] &&
-              git show-ref --verify --quiet "refs/remotes/origin/$SOURCE_REF_INPUT" &&
-              ! git show-ref --verify --quiet "refs/tags/$SOURCE_REF_INPUT"; then
-              vcs_branch="$SOURCE_REF_INPUT"
-            fi
-          elif [[ "$GITHUB_REF" == refs/heads/* ]]; then
-            vcs_branch="${GITHUB_REF#refs/heads/}"
-          elif [[ -n "$HEAD_REF_INPUT" ]]; then
-            vcs_branch="$HEAD_REF_INPUT"
-          fi
+          vcs_branch="$(bash .github/scripts/resolve-vcs-branch.sh)"
 
           {
             echo "vcs_sha=$(git rev-parse HEAD)"
@@ -396,24 +362,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          vcs_branch=""
-          if [[ "$SOURCE_REF_INPUT" == refs/heads/* ]]; then
-            vcs_branch="${SOURCE_REF_INPUT#refs/heads/}"
-          elif [[ "$SOURCE_REF_INPUT" == refs/remotes/origin/* ]]; then
-            vcs_branch="${SOURCE_REF_INPUT#refs/remotes/origin/}"
-          elif [[ -n "$SOURCE_REF_INPUT" ]]; then
-            # An unqualified ref is only a branch when it resolves uniquely
-            # to a branch, not when a tag with the same name also exists.
-            if [[ "$SOURCE_REF_INPUT" != refs/* ]] &&
-              git show-ref --verify --quiet "refs/remotes/origin/$SOURCE_REF_INPUT" &&
-              ! git show-ref --verify --quiet "refs/tags/$SOURCE_REF_INPUT"; then
-              vcs_branch="$SOURCE_REF_INPUT"
-            fi
-          elif [[ "$GITHUB_REF" == refs/heads/* ]]; then
-            vcs_branch="${GITHUB_REF#refs/heads/}"
-          elif [[ -n "$HEAD_REF_INPUT" ]]; then
-            vcs_branch="$HEAD_REF_INPUT"
-          fi
+          vcs_branch="$(bash .github/scripts/resolve-vcs-branch.sh)"
 
           {
             echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
