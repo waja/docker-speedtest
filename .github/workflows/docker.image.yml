@@ -203,17 +203,6 @@ jobs:
             VCS_REF=${{ steps.build_metadata.outputs.vcs_ref }}
             VCS_URL=${{ needs.shiftleft.outputs.vcs_url }}
             VCS_BRANCH=${{ steps.build_metadata.outputs.vcs_branch }}
-      - name: Preserve tested source and resolver
-        run: |
-          git bundle create /tmp/source.bundle --all HEAD
-          cp .github/scripts/resolve-vcs-branch.sh /tmp/resolve-vcs-branch.sh
-      - name: Upload tested source and resolver
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.IMAGE_NAME }}-source-${{ github.run_number }}
-          path: |
-            /tmp/source.bundle
-            /tmp/resolve-vcs-branch.sh
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -379,20 +368,26 @@ jobs:
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
-      - name: Download tested source
-        uses: actions/download-artifact@v8
+      - name: Checkout tested source
+        uses: actions/checkout@v7
         with:
-          name: ${{ env.IMAGE_NAME }}-source-${{ github.run_number }}
-          path: /tmp/source
-      - name: Restore tested source tree
+          ref: ${{ needs.test-build.outputs.tested_sha }}
+          fetch-depth: 0
+
+      - name: Verify tested source
+        env:
+          EXPECTED_SHA: ${{ needs.test-build.outputs.tested_sha }}
         run: |
           set -euo pipefail
-          git init .
-          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          git fetch /tmp/source/source.bundle '+refs/*:refs/*'
-          git fetch /tmp/source/source.bundle HEAD
-          git checkout --detach FETCH_HEAD
-          test "$(git rev-parse HEAD)" = "${{ needs.test-build.outputs.tested_sha }}"
+          test -n "$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Checkout workflow tools
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
+          path: .workflow-tools
+          fetch-depth: 0
 
       - name: Prepare image metadata
         id: metadata
@@ -408,7 +403,7 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
             vcs_branch="$HEAD_REF_INPUT"
           else
-            vcs_branch="$(bash /tmp/source/resolve-vcs-branch.sh)"
+            vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
           fi
 
           {
