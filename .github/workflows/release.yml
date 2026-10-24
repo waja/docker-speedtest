@@ -449,9 +449,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           RUN_ID: ${{ steps.test_dispatch.outputs.run_id }}
-          DISPLAY_TITLE: >-
-            Docker Image CI release-test-${{ inputs.tag }}-
-            ${{ steps.release_commit.outputs.sha }}
+          DISPLAY_TITLE: Docker Image CI release-test-${{ inputs.tag }}-${{ steps.release_commit.outputs.sha }}
           DISPATCHED_AT: ${{ steps.test_dispatch.outputs.dispatched_at }}
         run: |
           set -euo pipefail
@@ -544,9 +542,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           RUN_ID: ${{ steps.docker_dispatch.outputs.run_id }}
-          DISPLAY_TITLE: >-
-            Docker Image CI release-publish-${{ inputs.tag }}-
-            ${{ steps.release_commit.outputs.sha }}
+          DISPLAY_TITLE: Docker Image CI release-publish-${{ inputs.tag }}-${{ steps.release_commit.outputs.sha }}
           DISPATCHED_AT: ${{ steps.docker_dispatch.outputs.dispatched_at }}
         run: |
           set -euo pipefail
