@@ -90,7 +90,7 @@ jobs:
       - name: Checkout workflow tools
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
+          ref: ${{ github.sha }}
           path: .workflow-tools
           fetch-depth: 0
 
@@ -146,7 +146,7 @@ jobs:
       - name: Checkout workflow tools
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
+          ref: ${{ github.sha }}
           path: .workflow-tools
           fetch-depth: 0
 
