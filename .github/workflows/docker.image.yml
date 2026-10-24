@@ -181,6 +181,13 @@ jobs:
             VCS_REF=${{ steps.build_metadata.outputs.vcs_ref }}
             VCS_URL=${{ needs.shiftleft.outputs.vcs_url }}
             VCS_BRANCH=${{ steps.build_metadata.outputs.vcs_branch }}
+      - name: Preserve tested source
+        run: git bundle create /tmp/source.bundle HEAD
+      - name: Upload tested source
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.IMAGE_NAME }}-source-${{ github.run_number }}
+          path: /tmp/source.bundle
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -346,11 +353,16 @@ jobs:
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - name: Download tested source
+        uses: actions/download-artifact@v8
         with:
-          ref: ${{ needs.test-build.outputs.tested_sha }}
-          fetch-depth: 0
+          name: ${{ env.IMAGE_NAME }}-source-${{ github.run_number }}
+          path: /tmp/source
+      - name: Restore tested source tree
+        run: |
+          set -euo pipefail
+          git clone /tmp/source/source.bundle .
+          test "$(git rev-parse HEAD)" = "${{ needs.test-build.outputs.tested_sha }}"
 
       - name: Prepare image metadata
         id: metadata
