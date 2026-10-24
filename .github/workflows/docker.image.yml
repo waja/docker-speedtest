@@ -75,10 +75,7 @@ jobs:
     name: shiftleft
     outputs:
       build_date: ${{ steps.metadata.outputs.build_date }}
-      build_version: ${{ steps.metadata.outputs.build_version }}
-      vcs_ref: ${{ steps.metadata.outputs.vcs_ref }}
       vcs_url: ${{ steps.metadata.outputs.vcs_url }}
-      vcs_branch: ${{ steps.metadata.outputs.vcs_branch }}
     strategy:
       fail-fast: false
     runs-on: ubuntu-latest
@@ -87,36 +84,13 @@ jobs:
         with:
           ref: ${{ inputs.source_ref || (github.event_name == 'pull_request' && github.sha) || github.ref }}
           fetch-depth: 0
-      - name: Checkout workflow tools
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
-          path: .workflow-tools
-          fetch-depth: 0
-
       - name: Prepare image metadata
         id: metadata
-        env:
-          BUILD_VERSION_INPUT: ${{ inputs.image_version }}
-          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
-          HEAD_REF_INPUT: ${{ github.head_ref }}
-          REF_NAME_INPUT: ${{ github.ref_name }}
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
-
-          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-            vcs_branch="$HEAD_REF_INPUT"
-          else
-            vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
-          fi
-
           {
             echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
-            echo "vcs_ref=$(git rev-parse --short HEAD)"
             echo "vcs_url=$(git config --get remote.origin.url)"
-            echo "vcs_branch=$vcs_branch"
           } >> "$GITHUB_OUTPUT"
 
       - name: Perform ShiftLeft Scan
