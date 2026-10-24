@@ -206,7 +206,7 @@ jobs:
       - name: Preserve tested source and resolver
         run: |
           git bundle create /tmp/source.bundle --all HEAD
-          cp .workflow-tools/.github/scripts/resolve-vcs-branch.sh /tmp/resolve-vcs-branch.sh
+          cp .github/scripts/resolve-vcs-branch.sh /tmp/resolve-vcs-branch.sh
       - name: Upload tested source and resolver
         uses: actions/upload-artifact@v7
         with:
