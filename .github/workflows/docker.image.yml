@@ -492,8 +492,8 @@ jobs:
 
           # Workflow-level concurrency serializes runs for this ref. A second
           # run must also avoid publishing if an earlier run already succeeded.
-          if [[ "$PUBLISH_INPUT" != "false" && "$REPLACEMENT_INPUT" != "true" && \\
-                "$VERSION" =~ ^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}-[0-9]{1,3}$ ]]; then
+          if [[ "$PUBLISH_INPUT" != "false" && "$REPLACEMENT_INPUT" != "true" && \
+                "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$ ]]; then
             source_sha="${SOURCE_REF_INPUT:-$GITHUB_SHA}"
             publish_title="Docker Image CI release-publish-$VERSION-$source_sha"
             run_lines=$(gh api --paginate --method GET \
