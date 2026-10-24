@@ -61,7 +61,7 @@ jobs:
         with:
           # super-linter needs the full git history to get the
           # list of files that changed across commits
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ inputs.source_ref || (github.event_name == 'pull_request' && github.sha) || github.ref }}
           fetch-depth: 0
       - name: Lint Code Base
         uses: super-linter/super-linter@v9.0.0
@@ -85,7 +85,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ inputs.source_ref || (github.event_name == 'pull_request' && github.sha) || github.ref }}
           fetch-depth: 0
       - name: Checkout workflow tools
         uses: actions/checkout@v7
@@ -146,7 +146,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ inputs.source_ref || (github.event_name == 'pull_request' && github.sha) || github.ref }}
           fetch-depth: 0
       - name: Checkout workflow tools
         uses: actions/checkout@v7
