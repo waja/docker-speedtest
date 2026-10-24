@@ -1,7 +1,32 @@
+---
 name: Docker Image CI
 
+run-name: Docker Image CI ${{ inputs.test_id || inputs.image_version || github.ref_name }}
+
+# checkov:skip=CKV_GHA_7: The release workflow needs test-only workflow inputs.
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish images after tests (false runs tests only)"
+        required: false
+        type: boolean
+        default: true
+      source_ref:
+        description: "Commit or ref to check out for release validation"
+        required: false
+        type: string
+        default: ""
+      test_id:
+        description: "Optional unique run name used by release automation"
+        required: false
+        type: string
+        default: ""
+      image_version:
+        description: "Override the image version for release automation"
+        required: false
+        type: string
+        default: ""
   push:
     branches:
       - $default-branch
@@ -13,6 +38,13 @@ on:
   pull_request:
   schedule:
     - cron: "43 10 * * 4"
+
+# Prevent two runs for the same branch or tag from publishing concurrently.
+concurrency:
+  group: >-
+    docker-image-${{ inputs.publish == false && inputs.test_id ||
+      inputs.image_version || github.ref_name }}
+  cancel-in-progress: false
 
 env:
   IMAGE_NAME: speedtest
@@ -29,6 +61,7 @@ jobs:
         with:
           # super-linter needs the full git history to get the
           # list of files that changed across commits
+          ref: ${{ inputs.source_ref || (github.event_name == 'pull_request' && github.sha) || github.ref }}
           fetch-depth: 0
       - name: Lint Code Base
         uses: super-linter/super-linter@v9.0.0
@@ -40,11 +73,52 @@ jobs:
           VALIDATE_BIOME_FORMAT: false
   shiftleft:
     name: shiftleft
+    outputs:
+      build_date: ${{ steps.metadata.outputs.build_date }}
+      build_version: ${{ steps.metadata.outputs.build_version }}
+      vcs_ref: ${{ steps.metadata.outputs.vcs_ref }}
+      vcs_url: ${{ steps.metadata.outputs.vcs_url }}
+      vcs_branch: ${{ steps.metadata.outputs.vcs_branch }}
     strategy:
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || (github.event_name == 'pull_request' && github.sha) || github.ref }}
+          fetch-depth: 0
+      - name: Checkout workflow tools
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
+          path: .workflow-tools
+          fetch-depth: 0
+
+      - name: Prepare image metadata
+        id: metadata
+        env:
+          BUILD_VERSION_INPUT: ${{ inputs.image_version }}
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+          HEAD_REF_INPUT: ${{ github.head_ref }}
+          REF_NAME_INPUT: ${{ github.ref_name }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            vcs_branch="$HEAD_REF_INPUT"
+          else
+            vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
+          fi
+
+          {
+            echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
+            echo "vcs_ref=$(git rev-parse --short HEAD)"
+            echo "vcs_url=$(git config --get remote.origin.url)"
+            echo "vcs_branch=$vcs_branch"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Perform ShiftLeft Scan
         uses: ShiftLeftSecurity/scan-action@v1.3.0
         env:
@@ -64,11 +138,47 @@ jobs:
     needs:
       - super-linter
       - shiftleft
+    outputs:
+      tested_sha: ${{ steps.build_metadata.outputs.vcs_sha }}
     strategy:
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.source_ref || (github.event_name == 'pull_request' && github.sha) || github.ref }}
+          fetch-depth: 0
+      - name: Checkout workflow tools
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
+          path: .workflow-tools
+          fetch-depth: 0
+
+      - name: Prepare build commit metadata
+        id: build_metadata
+        env:
+          BUILD_VERSION_INPUT: ${{ inputs.image_version }}
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+          HEAD_REF_INPUT: ${{ github.head_ref }}
+          REF_NAME_INPUT: ${{ github.ref_name }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            vcs_branch="$HEAD_REF_INPUT"
+          else
+            vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
+          fi
+
+          {
+            echo "vcs_sha=$(git rev-parse HEAD)"
+            echo "vcs_ref=$(git rev-parse --short HEAD)"
+            echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
+            echo "vcs_branch=$vcs_branch"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v4
@@ -88,11 +198,11 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           build-args: |
-            BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            BUILD_VERSION="$(git describe --tags)"
-            VCS_REF="$(git rev-parse --short HEAD)"
-            VCS_URL="$(git config --get remote.origin.url)"
-            VCS_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+            BUILD_DATE=${{ needs.shiftleft.outputs.build_date }}
+            BUILD_VERSION=${{ steps.build_metadata.outputs.build_version }}
+            VCS_REF=${{ steps.build_metadata.outputs.vcs_ref }}
+            VCS_URL=${{ needs.shiftleft.outputs.vcs_url }}
+            VCS_BRANCH=${{ steps.build_metadata.outputs.vcs_branch }}
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -249,6 +359,7 @@ jobs:
   release-docker:
     name: Release Docker images
     needs:
+      - test-build
       - test
       - dockle
       - trivy
@@ -257,15 +368,63 @@ jobs:
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout tested source
         uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.test-build.outputs.tested_sha }}
+          fetch-depth: 0
+
+      - name: Verify tested source
+        env:
+          EXPECTED_SHA: ${{ needs.test-build.outputs.tested_sha }}
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Checkout workflow tools
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
+          path: .workflow-tools
+          fetch-depth: 0
+
+      - name: Prepare image metadata
+        id: metadata
+        env:
+          BUILD_VERSION_INPUT: ${{ inputs.image_version }}
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+          HEAD_REF_INPUT: ${{ github.head_ref }}
+          REF_NAME_INPUT: ${{ github.ref_name }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            vcs_branch="$HEAD_REF_INPUT"
+          else
+            vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
+          fi
+
+          {
+            echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
+            echo "vcs_ref=$(git rev-parse --short HEAD)"
+            echo "vcs_url=$(git config --get remote.origin.url)"
+            echo "vcs_branch=$vcs_branch"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prepare
         id: prep
+        if: ${{ github.event_name != 'pull_request' }}
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+          IMAGE_VERSION_INPUT: ${{ inputs.image_version }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
           QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
         run: |
@@ -289,6 +448,11 @@ jobs:
           # running on master branch
           if [ "$VERSION" = "master" ]; then
             VERSION=latest
+          fi
+          # Release automation can run the workflow from the default branch
+          # while explicitly checking out the tested merge commit.
+          if [[ -n "$IMAGE_VERSION_INPUT" ]]; then
+            VERSION="$IMAGE_VERSION_INPUT"
           fi
           TAGS="${DOCKER_IMAGE}:${VERSION}"
           if [[ "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\-[0-9]{1,3}$ ]]; then
@@ -318,6 +482,35 @@ jobs:
             fi
           fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "skip_publish=false" >> "$GITHUB_OUTPUT"
+
+          # Workflow-level concurrency serializes runs for this ref. A second
+          # run must also avoid publishing if an earlier run already succeeded.
+          if [[ "$PUBLISH_INPUT" != "false" && \
+                "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$ ]]; then
+            source_sha="${SOURCE_REF_INPUT:-$GITHUB_SHA}"
+            publish_title="Docker Image CI release-publish-$VERSION-$source_sha"
+            run_lines=$(gh api --paginate --method GET \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/docker.image.yml/runs" \
+              -F per_page=100 \
+              --jq '.workflow_runs[] | {id,event,head_sha,head_branch,display_title,conclusion}')
+            successful=$(jq -s --arg sha "$source_sha" --arg tag "$VERSION" \
+              --arg title "$publish_title" --argjson current "$GITHUB_RUN_ID" '
+                [.[] | select(
+                  .id != $current
+                  and .conclusion == "success"
+                  and (
+                    ((.head_branch == $tag) and (.head_sha == $sha)
+                      and (.event == "push" or .event == "workflow_dispatch"))
+                    or .display_title == $title
+                  )
+                )] | length
+              ' <<< "$run_lines")
+            if [[ "$successful" -gt 0 ]]; then
+              echo "A successful image run already exists for $VERSION at $source_sha."
+              echo "skip_publish=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
 
       - name: Download artifact
         uses: actions/download-artifact@v8
@@ -386,13 +579,14 @@ jobs:
           file: ./Dockerfile
           platforms: linux/amd64
           build-args: |
-            BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            BUILD_VERSION="$(git describe --tags)"
-            VCS_REF="$(git rev-parse --short HEAD)"
-            VCS_URL="$(git config --get remote.origin.url)"
-            VCS_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+            BUILD_DATE=${{ steps.metadata.outputs.build_date }}
+            BUILD_VERSION=${{ steps.metadata.outputs.build_version }}
+            VCS_REF=${{ steps.metadata.outputs.vcs_ref }}
+            VCS_URL=${{ steps.metadata.outputs.vcs_url }}
+            VCS_BRANCH=${{ steps.metadata.outputs.vcs_branch }}
 
       - name: Build and push
+        if: steps.prep.outputs.skip_publish != 'true'
         id: docker_build
         uses: docker/build-push-action@v7
         with:
@@ -400,17 +594,17 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
           tags: |
             ${{ steps.prep.outputs.tags }}
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache
           build-args: |
-            BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            BUILD_VERSION="$(git describe --tags)"
-            VCS_REF="$(git rev-parse --short HEAD)"
-            VCS_URL="$(git config --get remote.origin.url)"
-            VCS_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+            BUILD_DATE=${{ steps.metadata.outputs.build_date }}
+            BUILD_VERSION=${{ steps.metadata.outputs.build_version }}
+            VCS_REF=${{ steps.metadata.outputs.vcs_ref }}
+            VCS_URL=${{ steps.metadata.outputs.vcs_url }}
+            VCS_BRANCH=${{ steps.metadata.outputs.vcs_branch }}
 
       - name: Image digest
         run: echo ${{ steps.docker_build.outputs.digest }}
