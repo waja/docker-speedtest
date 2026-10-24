@@ -99,20 +99,22 @@ jobs:
           set -euo pipefail
 
           vcs_branch=""
-          if [[ -n "$SOURCE_REF_INPUT" ]]; then
-            # Only label the image with source_ref when it names a branch.
-            if git show-ref --verify --quiet "refs/remotes/origin/$SOURCE_REF_INPUT" ||
-              git show-ref --verify --quiet "refs/heads/$SOURCE_REF_INPUT"; then
+          if [[ "$SOURCE_REF_INPUT" == refs/heads/* ]]; then
+            vcs_branch="${SOURCE_REF_INPUT#refs/heads/}"
+          elif [[ "$SOURCE_REF_INPUT" == refs/remotes/origin/* ]]; then
+            vcs_branch="${SOURCE_REF_INPUT#refs/remotes/origin/}"
+          elif [[ -n "$SOURCE_REF_INPUT" ]]; then
+            # An unqualified ref is only a branch when it resolves uniquely
+            # to a branch, not when a tag with the same name also exists.
+            if [[ "$SOURCE_REF_INPUT" != refs/* ]] &&
+              git show-ref --verify --quiet "refs/remotes/origin/$SOURCE_REF_INPUT" &&
+              ! git show-ref --verify --quiet "refs/tags/$SOURCE_REF_INPUT"; then
               vcs_branch="$SOURCE_REF_INPUT"
             fi
+          elif [[ "$GITHUB_REF" == refs/heads/* ]]; then
+            vcs_branch="${GITHUB_REF#refs/heads/}"
           elif [[ -n "$HEAD_REF_INPUT" ]]; then
             vcs_branch="$HEAD_REF_INPUT"
-          else
-            # A tag or commit SHA is not a branch name.
-            if git show-ref --verify --quiet "refs/remotes/origin/$REF_NAME_INPUT" ||
-              git show-ref --verify --quiet "refs/heads/$REF_NAME_INPUT"; then
-              vcs_branch="$REF_NAME_INPUT"
-            fi
           fi
 
           {
@@ -142,6 +144,8 @@ jobs:
     needs:
       - super-linter
       - shiftleft
+    outputs:
+      tested_sha: ${{ steps.build_metadata.outputs.vcs_sha }}
     strategy:
       fail-fast: false
     runs-on: ubuntu-latest
@@ -162,23 +166,26 @@ jobs:
           set -euo pipefail
 
           vcs_branch=""
-          if [[ -n "$SOURCE_REF_INPUT" ]]; then
-            # Only label the image with source_ref when it names a branch.
-            if git show-ref --verify --quiet "refs/remotes/origin/$SOURCE_REF_INPUT" ||
-              git show-ref --verify --quiet "refs/heads/$SOURCE_REF_INPUT"; then
+          if [[ "$SOURCE_REF_INPUT" == refs/heads/* ]]; then
+            vcs_branch="${SOURCE_REF_INPUT#refs/heads/}"
+          elif [[ "$SOURCE_REF_INPUT" == refs/remotes/origin/* ]]; then
+            vcs_branch="${SOURCE_REF_INPUT#refs/remotes/origin/}"
+          elif [[ -n "$SOURCE_REF_INPUT" ]]; then
+            # An unqualified ref is only a branch when it resolves uniquely
+            # to a branch, not when a tag with the same name also exists.
+            if [[ "$SOURCE_REF_INPUT" != refs/* ]] &&
+              git show-ref --verify --quiet "refs/remotes/origin/$SOURCE_REF_INPUT" &&
+              ! git show-ref --verify --quiet "refs/tags/$SOURCE_REF_INPUT"; then
               vcs_branch="$SOURCE_REF_INPUT"
             fi
+          elif [[ "$GITHUB_REF" == refs/heads/* ]]; then
+            vcs_branch="${GITHUB_REF#refs/heads/}"
           elif [[ -n "$HEAD_REF_INPUT" ]]; then
             vcs_branch="$HEAD_REF_INPUT"
-          else
-            # A tag or commit SHA is not a branch name.
-            if git show-ref --verify --quiet "refs/remotes/origin/$REF_NAME_INPUT" ||
-              git show-ref --verify --quiet "refs/heads/$REF_NAME_INPUT"; then
-              vcs_branch="$REF_NAME_INPUT"
-            fi
           fi
 
           {
+            echo "vcs_sha=$(git rev-parse HEAD)"
             echo "vcs_ref=$(git rev-parse --short HEAD)"
             echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
             echo "vcs_branch=$vcs_branch"
@@ -364,6 +371,7 @@ jobs:
   release-docker:
     name: Release Docker images
     needs:
+      - test-build
       - test
       - dockle
       - trivy
@@ -375,7 +383,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ needs.test-build.outputs.tested_sha }}
           fetch-depth: 0
 
       - name: Prepare image metadata
@@ -389,20 +397,22 @@ jobs:
           set -euo pipefail
 
           vcs_branch=""
-          if [[ -n "$SOURCE_REF_INPUT" ]]; then
-            # Only label the image with source_ref when it names a branch.
-            if git show-ref --verify --quiet "refs/remotes/origin/$SOURCE_REF_INPUT" ||
-              git show-ref --verify --quiet "refs/heads/$SOURCE_REF_INPUT"; then
+          if [[ "$SOURCE_REF_INPUT" == refs/heads/* ]]; then
+            vcs_branch="${SOURCE_REF_INPUT#refs/heads/}"
+          elif [[ "$SOURCE_REF_INPUT" == refs/remotes/origin/* ]]; then
+            vcs_branch="${SOURCE_REF_INPUT#refs/remotes/origin/}"
+          elif [[ -n "$SOURCE_REF_INPUT" ]]; then
+            # An unqualified ref is only a branch when it resolves uniquely
+            # to a branch, not when a tag with the same name also exists.
+            if [[ "$SOURCE_REF_INPUT" != refs/* ]] &&
+              git show-ref --verify --quiet "refs/remotes/origin/$SOURCE_REF_INPUT" &&
+              ! git show-ref --verify --quiet "refs/tags/$SOURCE_REF_INPUT"; then
               vcs_branch="$SOURCE_REF_INPUT"
             fi
+          elif [[ "$GITHUB_REF" == refs/heads/* ]]; then
+            vcs_branch="${GITHUB_REF#refs/heads/}"
           elif [[ -n "$HEAD_REF_INPUT" ]]; then
             vcs_branch="$HEAD_REF_INPUT"
-          else
-            # A tag or commit SHA is not a branch name.
-            if git show-ref --verify --quiet "refs/remotes/origin/$REF_NAME_INPUT" ||
-              git show-ref --verify --quiet "refs/heads/$REF_NAME_INPUT"; then
-              vcs_branch="$REF_NAME_INPUT"
-            fi
           fi
 
           {
