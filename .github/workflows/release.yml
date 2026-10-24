@@ -75,9 +75,14 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.tag }}
           REPOSITORY: ${{ github.repository }}
+          ALLOW_TAG_REPLACEMENT: ${{ inputs.allow_tag_replacement }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
+          case "$ALLOW_TAG_REPLACEMENT" in
+            true|false) ;;
+            *) echo "::error::Invalid allow_tag_replacement input."; exit 1 ;;
+          esac
 
           # This project's tags use version-build names such as 2.1.3-35.
           tag_pattern='^[0-9]{1,3}\.[0-9]{1,3}\.'
@@ -117,7 +122,7 @@ jobs:
           tag_file=$(mktemp)
           tag_error=$(mktemp)
           if gh api "$API/git/ref/tags/$RELEASE_TAG" >"$tag_file" 2>"$tag_error"; then
-            if [[ "${{ inputs.allow_tag_replacement }}" == "true" ]]; then
+            if [[ "$ALLOW_TAG_REPLACEMENT" == "true" ]]; then
               release_sha=$(gh api "$API/git/ref/heads/master" --jq '.object.sha')
               assert_on_master_history "$release_sha"
               mode=replace_tagged
@@ -528,16 +533,20 @@ jobs:
             "$API/actions/workflows/docker.image.yml/runs" \
             -F per_page=100 \
             --jq '.workflow_runs[] | {id,event,head_sha,head_branch,display_title,status,conclusion,created_at,html_url}')
-          existing=$(jq -s -c --arg sha "$RELEASE_SHA" \
-            --arg tag "$RELEASE_TAG" --arg title "$PUBLISH_TITLE" '
-              [.[] | select(
-                (.display_title == $title)
-                or ((.head_branch == $tag)
-                  and .head_sha == $sha
-                  and (.event == "push" or .event == "workflow_dispatch"))
-              )]
-              | sort_by(.created_at) | last // empty
-            ' <<< "$run_lines")
+          if [[ "$ALLOW_TAG_REPLACEMENT" == "true" ]]; then
+            existing=
+          else
+            existing=$(jq -s -c --arg sha "$RELEASE_SHA" \
+              --arg tag "$RELEASE_TAG" --arg title "$PUBLISH_TITLE" '
+                [.[] | select(
+                  (.display_title == $title)
+                  or ((.head_branch == $tag)
+                    and .head_sha == $sha
+                    and (.event == "push" or .event == "workflow_dispatch"))
+                )]
+                | sort_by(.created_at) | last // empty
+              ' <<< "$run_lines")
+          fi
           if [[ -n "$existing" ]]; then
             status=$(jq -r '.status' <<< "$existing")
             conclusion=$(jq -r '.conclusion // empty' <<< "$existing")
@@ -554,7 +563,9 @@ jobs:
           gh workflow run docker.image.yml --repo "$REPOSITORY" \
             --ref "$DEFAULT_BRANCH" \
             -f publish=true -f source_ref="$RELEASE_SHA" \
-            -f test_id="$PUBLISH_ID" -f image_version="$RELEASE_TAG"
+            -f test_id="release-publish-$RELEASE_TAG-$RELEASE_SHA" \
+            -f image_version="$RELEASE_TAG" \
+            -f replacement="$ALLOW_TAG_REPLACEMENT"
           echo "dispatched_at=$dispatched_at" >> "$GITHUB_OUTPUT"
           echo "Started Docker image publication for $RELEASE_TAG."
 
@@ -565,7 +576,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           RUN_ID: ${{ steps.docker_dispatch.outputs.run_id }}
-          DISPLAY_TITLE: Docker Image CI release-publish-${{ inputs.tag }}-${{ steps.release_commit.outputs.sha }}${{ inputs.allow_tag_replacement && format('-replacement-{0}', github.run_id) || '' }}
+          DISPLAY_TITLE: Docker Image CI release-publish-${{ inputs.tag }}-${{ steps.release_commit.outputs.sha }}
           DISPATCHED_AT: ${{ steps.docker_dispatch.outputs.dispatched_at }}
         run: |
           set -euo pipefail
