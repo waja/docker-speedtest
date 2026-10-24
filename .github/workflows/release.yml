@@ -486,15 +486,20 @@ jobs:
             exit 1
           fi
 
-          # The tag was absent during validation. This POST cannot overwrite
-          # an existing ref; on a race, fail and retry through tag recovery.
-          if ! gh api --method POST "$API/git/refs" \
-            -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$RELEASE_SHA"; then
-            echo "::error::Could not create the release tag."
-            echo "The tag may have been created concurrently; retry to resume."
-            exit 1
+          if [[ "${{ steps.validate.outputs.mode }}" == "replace_tagged" ]]; then
+            gh api --method PATCH "$API/git/refs/tags/$RELEASE_TAG" \
+              -f "sha=$RELEASE_SHA" -F force=true
+            echo "Moved $RELEASE_TAG to tested commit $RELEASE_SHA."
+          else
+            # The tag was absent during validation. POST cannot overwrite it.
+            if ! gh api --method POST "$API/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$RELEASE_SHA"; then
+              echo "::error::Could not create the release tag."
+              echo "The tag may have been created concurrently; retry to resume."
+              exit 1
+            fi
+            echo "Created $RELEASE_TAG at tested commit $RELEASE_SHA."
           fi
-          echo "Created $RELEASE_TAG at tested commit $RELEASE_SHA."
 
       - name: Start or resume Docker image publication
         id: docker_dispatch
