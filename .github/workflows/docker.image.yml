@@ -61,7 +61,7 @@ jobs:
         with:
           # super-linter needs the full git history to get the
           # list of files that changed across commits
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ inputs.source_ref || (github.event_name == 'pull_request' && github.sha) || github.ref }}
           fetch-depth: 0
       - name: Lint Code Base
         uses: super-linter/super-linter@v9.0.0
@@ -85,22 +85,38 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ inputs.source_ref || (github.event_name == 'pull_request' && github.sha) || github.ref }}
+          fetch-depth: 0
+      - name: Checkout workflow tools
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
+          path: .workflow-tools
           fetch-depth: 0
 
       - name: Prepare image metadata
         id: metadata
         env:
           BUILD_VERSION_INPUT: ${{ inputs.image_version }}
-          VCS_BRANCH_INPUT: ${{ inputs.image_version || github.head_ref || github.ref_name }}
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+          HEAD_REF_INPUT: ${{ github.head_ref }}
+          REF_NAME_INPUT: ${{ github.ref_name }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            vcs_branch="$HEAD_REF_INPUT"
+          else
+            vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
+          fi
+
           {
             echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
             echo "vcs_ref=$(git rev-parse --short HEAD)"
             echo "vcs_url=$(git config --get remote.origin.url)"
-            echo "vcs_branch=$VCS_BRANCH_INPUT"
+            echo "vcs_branch=$vcs_branch"
           } >> "$GITHUB_OUTPUT"
 
       - name: Perform ShiftLeft Scan
@@ -122,14 +138,46 @@ jobs:
     needs:
       - super-linter
       - shiftleft
+    outputs:
+      tested_sha: ${{ steps.build_metadata.outputs.vcs_sha }}
     strategy:
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ inputs.source_ref || (github.event_name == 'pull_request' && github.sha) || github.ref }}
           fetch-depth: 0
+      - name: Checkout workflow tools
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
+          path: .workflow-tools
+          fetch-depth: 0
+
+      - name: Prepare build commit metadata
+        id: build_metadata
+        env:
+          BUILD_VERSION_INPUT: ${{ inputs.image_version }}
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+          HEAD_REF_INPUT: ${{ github.head_ref }}
+          REF_NAME_INPUT: ${{ github.ref_name }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            vcs_branch="$HEAD_REF_INPUT"
+          else
+            vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
+          fi
+
+          {
+            echo "vcs_sha=$(git rev-parse HEAD)"
+            echo "vcs_ref=$(git rev-parse --short HEAD)"
+            echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
+            echo "vcs_branch=$vcs_branch"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         id: buildx
@@ -151,10 +199,10 @@ jobs:
           platforms: linux/amd64
           build-args: |
             BUILD_DATE=${{ needs.shiftleft.outputs.build_date }}
-            BUILD_VERSION=${{ needs.shiftleft.outputs.build_version }}
-            VCS_REF=${{ needs.shiftleft.outputs.vcs_ref }}
+            BUILD_VERSION=${{ steps.build_metadata.outputs.build_version }}
+            VCS_REF=${{ steps.build_metadata.outputs.vcs_ref }}
             VCS_URL=${{ needs.shiftleft.outputs.vcs_url }}
-            VCS_BRANCH=${{ needs.shiftleft.outputs.vcs_branch }}
+            VCS_BRANCH=${{ steps.build_metadata.outputs.vcs_branch }}
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
@@ -311,6 +359,7 @@ jobs:
   release-docker:
     name: Release Docker images
     needs:
+      - test-build
       - test
       - dockle
       - trivy
@@ -319,29 +368,55 @@ jobs:
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout tested source
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.source_ref || github.ref }}
+          ref: ${{ needs.test-build.outputs.tested_sha }}
+          fetch-depth: 0
+
+      - name: Verify tested source
+        env:
+          EXPECTED_SHA: ${{ needs.test-build.outputs.tested_sha }}
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: Checkout workflow tools
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
+          path: .workflow-tools
           fetch-depth: 0
 
       - name: Prepare image metadata
         id: metadata
         env:
           BUILD_VERSION_INPUT: ${{ inputs.image_version }}
-          VCS_BRANCH_INPUT: ${{ inputs.image_version || github.head_ref || github.ref_name }}
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+          HEAD_REF_INPUT: ${{ github.head_ref }}
+          REF_NAME_INPUT: ${{ github.ref_name }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            vcs_branch="$HEAD_REF_INPUT"
+          else
+            vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
+          fi
+
           {
             echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
             echo "vcs_ref=$(git rev-parse --short HEAD)"
             echo "vcs_url=$(git config --get remote.origin.url)"
-            echo "vcs_branch=$VCS_BRANCH_INPUT"
+            echo "vcs_branch=$vcs_branch"
           } >> "$GITHUB_OUTPUT"
 
       - name: Prepare
         id: prep
+        if: ${{ github.event_name != 'pull_request' }}
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
