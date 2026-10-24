@@ -497,7 +497,6 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           ALLOW_TAG_REPLACEMENT: ${{ inputs.allow_tag_replacement }}
-          ALLOW_TAG_REPLACEMENT: ${{ inputs.allow_tag_replacement }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
