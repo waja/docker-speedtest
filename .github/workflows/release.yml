@@ -485,6 +485,7 @@ jobs:
         if: steps.validate.outputs.mode != 'tagged'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          TAG_PUSH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
@@ -501,13 +502,15 @@ jobs:
             expected_ref_sha="${{ steps.validate.outputs.tag_ref_sha }}"
             # GitHub's ref PATCH endpoint has no compare-and-swap condition.
             # A force-with-lease push atomically rejects a stale expected ref.
-            git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" \
+            # Use GITHUB_TOKEN for the tag mutation so this workflow's
+            # own replacement does not trigger a competing tag-push publisher.
+            git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TAG_PUSH_TOKEN" | base64 -w0)" \
               push --force-with-lease="refs/tags/$RELEASE_TAG:$expected_ref_sha" \
               origin "$RELEASE_SHA:refs/tags/$RELEASE_TAG"
             echo "Moved $RELEASE_TAG to tested commit $RELEASE_SHA."
           else
             # The tag was absent during validation. POST cannot overwrite it.
-            if ! gh api --method POST "$API/git/refs" \
+            if ! GH_TOKEN="$TAG_PUSH_TOKEN" gh api --method POST "$API/git/refs" \
               -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$RELEASE_SHA"; then
               echo "::error::Could not create the release tag."
               echo "The tag may have been created concurrently; retry to resume."
