@@ -519,7 +519,7 @@ jobs:
           fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
           echo "skip_publish=false" >> "$GITHUB_OUTPUT"
-remove tag skip          # Workflow-level concurrency serializes runs for this ref. A second
+          # Workflow-level concurrency serializes runs for this ref. A second
           # run must also avoid publishing if an earlier run already succeeded.
           if [[ "$PUBLISH_INPUT" != "false" && "$replacement_effective" != "true" && \
                 "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$ ]]; then
