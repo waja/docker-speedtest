@@ -497,7 +497,8 @@ jobs:
             expected_ref_sha="${{ steps.validate.outputs.tag_ref_sha }}"
             # GitHub's ref PATCH endpoint has no compare-and-swap condition.
             # A force-with-lease push atomically rejects a stale expected ref.
-            git push --force-with-lease="refs/tags/$RELEASE_TAG:$expected_ref_sha" \
+            git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" \
+              push --force-with-lease="refs/tags/$RELEASE_TAG:$expected_ref_sha" \
               origin "$RELEASE_SHA:refs/tags/$RELEASE_TAG"
             echo "Moved $RELEASE_TAG to tested commit $RELEASE_SHA."
           else
@@ -519,6 +520,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           RELEASE_MODE: ${{ steps.validate.outputs.mode }}
+          ALLOW_TAG_REPLACEMENT_INPUT: ${{ inputs.allow_tag_replacement }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
@@ -526,18 +528,15 @@ jobs:
           replacement_effective=false
           if [[ "$RELEASE_MODE" == "replace_tagged" ]]; then
             replacement_effective=true
-          elif [[ "$RELEASE_MODE" == "fresh" || "$RELEASE_MODE" == "merged" ]]; then
-            # A replacement cannot be authorized for a release whose tag was
-            # absent during validation. Fail before merge/tag creation.
-            echo "::error::Replacement mode is invalid when the release tag is absent."
+          elif [[ "$ALLOW_TAG_REPLACEMENT_INPUT" == "true" ]]; then
+            # A replacement request must have found an existing tag during
+            # validation; never let it become a fresh or merged release.
+            echo "::error::Cannot replace $RELEASE_TAG because its tag was absent during validation."
             exit 1
           fi
-          # The history checker extracts the commit SHA from this suffix.
-          # Keep it exactly 40 characters; use the run ID only as the test_id,
-          # not in the publication title.
-          PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA"
+          PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA-run-${GITHUB_RUN_ID}"
           PUBLISH_TITLE="Docker Image CI $PUBLISH_ID"
-          PUBLISH_TEST_ID="$PUBLISH_ID-run-${GITHUB_RUN_ID}"
+          PUBLISH_TEST_ID="$PUBLISH_ID"
 
           # Check tag history before any dispatch, then locate an existing
           # publication run (including older tag-ref workflow runs).
