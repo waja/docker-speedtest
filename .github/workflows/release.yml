@@ -553,10 +553,10 @@ jobs:
             existing=$(jq -s -c --arg sha "$RELEASE_SHA" \
               --arg tag "$RELEASE_TAG" --arg title "$PUBLISH_TITLE" '
                 [.[] | select(
-                  (.display_title == $title)
-                  or ((.head_branch == $tag)
-                    and .head_sha == $sha
-                    and (.event == "push" or .event == "workflow_dispatch"))
+                  # Only reuse an explicit release publication. Tag-push runs
+                  # publish version tags without latest and must not stand in
+                  # for this release workflow's publication.
+                  .display_title == $title
                 )]
                 | sort_by(.created_at) | last // empty
               ' <<< "$run_lines")
