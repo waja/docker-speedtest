@@ -482,7 +482,7 @@ jobs:
           # The replacement bypass is restricted to the validated release
           # workflow and re-checks the tag/source relationship independently.
           if [[ "$REPLACEMENT_INPUT" == "true" ]]; then
-            release_tag_pattern='^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}-[0-9]{1,3}$'
+            release_tag_pattern='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$'
             if [[ "$EVENT_NAME_INPUT" != "workflow_dispatch" ||
                   ! "$VERSION" =~ $release_tag_pattern ||
                   -z "$SOURCE_REF_INPUT" ]]; then
