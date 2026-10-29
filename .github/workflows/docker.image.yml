@@ -448,22 +448,10 @@ jobs:
             replacement_effective=true
           elif [[ "$EVENT_NAME_INPUT" == "push" &&
                   "$EVENT_REF_INPUT" == refs/tags/* ]]; then
-            # A tag can be recreated after deletion (zero before SHA) or
-            # force-updated directly. Consult prior tag-push runs so neither
-            # case can move latest backward.
-            tag_name="${EVENT_REF_INPUT#refs/tags/}"
-            prior_tag_runs=$(gh api --paginate --method GET \
-              "repos/$GITHUB_REPOSITORY/actions/workflows/docker.image.yml/runs" \
-              -f event=push -F per_page=100 \
-              --jq '.workflow_runs[] | {id,head_branch,head_sha}')
-            if jq -e --arg tag "$tag_name" --arg sha "$GITHUB_SHA" \
-              '[.[] | select(.head_branch == $tag and .head_sha != $sha)] | length > 0' \
-              <<< "$(jq -s '.' <<< "$prior_tag_runs")" >/dev/null; then
-              replacement_effective=true
-            elif [[ -n "$EVENT_BEFORE_INPUT" &&
-                    "$EVENT_BEFORE_INPUT" != "0000000000000000000000000000000000000000" ]]; then
-              replacement_effective=true
-            fi
+            # Tag pushes are not the trusted release entry point. Never let
+            # one update latest: a zero before-SHA is ambiguous between a new
+            # tag and a recreated tag after its earlier history was deleted.
+            replacement_effective=true
           fi
           IMAGE_NAME="$(echo "$GITHUB_REPOSITORY" | awk -F '/' '{print $2}' | sed  s/docker-//)"
           DOCKER_IMAGE="${USER}/${IMAGE_NAME}"
@@ -490,6 +478,195 @@ jobs:
           if [[ -n "$IMAGE_VERSION_INPUT" ]]; then
             VERSION="$IMAGE_VERSION_INPUT"
           fi
+
+          # The replacement bypass is only safe when the requested version is
+          # an existing release tag that already points to the tested source
+          # commit, and that commit is in master history. This independently
+          # validates workflow_dispatch callers; they cannot bypass the
+          # release workflow's validation by setting replacement=true.
+          if [[ "$REPLACEMENT_INPUT" == "true" ]]; then
+            release_tag_pattern='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}
+          if [[ "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\-[0-9]{1,3}$ ]]; then
+            REALEASE_TAG=true
+          fi
+          TAGS_INT="$TAGS"
+          TAGS=""
+          if [ "$DOCKERHUB_USERNAME" != '' ] && [ "$DOCKERHUB_TOKEN" != '' ]; then
+            if [ "$REALEASE_TAG" = "true" ] && [[ "$replacement_effective" != "true" ]]; then
+              TAGS="$TAGS_INT,${DOCKER_IMAGE}:latest"
+            else
+              TAGS="$TAGS_INT"
+            fi
+          fi
+          if [ "$GITHUB_TOKEN" != '' ]; then
+            if [ "$REALEASE_TAG" = "true" ] && [[ "$replacement_effective" != "true" ]]; then
+              TAGS="$TAGS,ghcr.io/$TAGS_INT,ghcr.io/${DOCKER_IMAGE}:latest"
+            else
+              TAGS="$TAGS,ghcr.io/$TAGS_INT"
+            fi
+          fi
+          if [ "$QUAY_USERNAME" != '' ] && [ "$QUAY_TOKEN" != '' ]; then
+            if [ "$REALEASE_TAG" = "true" ] && [[ "$replacement_effective" != "true" ]]; then
+              TAGS="$TAGS,quay.io/$TAGS_INT,quay.io/${DOCKER_IMAGE}:latest"
+            else
+              TAGS="$TAGS,quay.io/$TAGS_INT"
+            fi
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "skip_publish=false" >> "$GITHUB_OUTPUT"
+          # Workflow-level concurrency serializes runs for this ref. A second
+          # run must also avoid publishing if an earlier run already succeeded.
+          if [[ "$PUBLISH_INPUT" != "false" && "$replacement_effective" != "true" && \
+                "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$ ]]; then
+            source_sha="${SOURCE_REF_INPUT:-$GITHUB_SHA}"
+            publish_title="Docker Image CI release-publish-$VERSION-$source_sha"
+            run_lines=$(gh api --paginate --method GET \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/docker.image.yml/runs" \
+              -F per_page=100 \
+              --jq '.workflow_runs[] | {id,event,head_sha,head_branch,display_title,conclusion}')
+            successful=$(jq -s --arg sha "$source_sha" --arg tag "$VERSION" \
+              --arg title "$publish_title" --argjson current "$GITHUB_RUN_ID" '
+                [.[] | select(
+                  .id != $current
+                  and .conclusion == "success"
+                  and (
+                    ((.head_branch == $tag) and (.head_sha == $sha)
+                      and (.event == "push" or .event == "workflow_dispatch"))
+                    or .display_title == $title
+                  )
+                )] | length
+              ' <<< "$run_lines")
+            if [[ "$successful" -gt 0 ]]; then
+              echo "A successful image run already exists for $VERSION at $source_sha."
+              echo "skip_publish=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.IMAGE_NAME }}-${{ github.run_number }}
+          path: /tmp
+
+      - name: Load image from test job
+        run: |
+          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_number }}.tar
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: all
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Cache Docker layers
+        uses: actions/cache@v6
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Login to ghcr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        if: ${{ github.event_name != 'pull_request' && env.GITHUB_TOKEN != '' }}
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${USER}
+          password: ${{ env.GITHUB_TOKEN }}
+
+      - name: Login to DockerHub Container Registry
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        if: ${{ github.event_name != 'pull_request' && env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@v4
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Login to Quay Container Registry
+        env:
+          QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
+        if: ${{ github.event_name != 'pull_request' && env.QUAY_USERNAME != '' && env.QUAY_TOKEN != '' }}
+        uses: docker/login-action@v4
+        with:
+          registry: quay.io
+          username: ${{ env.QUAY_USERNAME }}
+          password: ${{ env.QUAY_TOKEN }}
+
+      - name: Test
+        id: docker_test
+        uses: docker/build-push-action@v7
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            BUILD_DATE=${{ steps.metadata.outputs.build_date }}
+            BUILD_VERSION=${{ steps.metadata.outputs.build_version }}
+            VCS_REF=${{ steps.metadata.outputs.vcs_ref }}
+            VCS_URL=${{ steps.metadata.outputs.vcs_url }}
+            VCS_BRANCH=${{ steps.metadata.outputs.vcs_branch }}
+
+      - name: Build and push
+        if: steps.prep.outputs.skip_publish != 'true'
+        id: docker_build
+        uses: docker/build-push-action@v7
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ./Dockerfile
+          platforms: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64
+          push: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
+          tags: |
+            ${{ steps.prep.outputs.tags }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
+          build-args: |
+            BUILD_DATE=${{ steps.metadata.outputs.build_date }}
+            BUILD_VERSION=${{ steps.metadata.outputs.build_version }}
+            VCS_REF=${{ steps.metadata.outputs.vcs_ref }}
+            VCS_URL=${{ steps.metadata.outputs.vcs_url }}
+            VCS_BRANCH=${{ steps.metadata.outputs.vcs_branch }}
+
+      - name: Image digest
+        run: echo ${{ steps.docker_build.outputs.digest }}
+
+            if [[ "$EVENT_NAME_INPUT" != "workflow_dispatch" ||
+                  ! "$VERSION" =~ $release_tag_pattern ||
+                  -z "$SOURCE_REF_INPUT" ]]; then
+              echo "::error::Replacement requires workflow_dispatch, a valid release tag, and an explicit source_ref."
+              exit 1
+            fi
+
+            source_sha="$(git rev-parse HEAD)"
+            tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION")
+            tag_type=$(jq -r '.object.type' <<< "$tag_json")
+            tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+            while [[ "$tag_type" == "tag" ]]; do
+              tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")
+              tag_type=$(jq -r '.object.type' <<< "$tag_json")
+              tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+            done
+            if [[ "$tag_type" != "commit" || "$tag_sha" != "$source_sha" ]]; then
+              echo "::error::Replacement tag $VERSION must already point to tested source $source_sha."
+              exit 1
+            fi
+
+            relation=$(gh api "repos/$GITHUB_REPOSITORY/compare/$source_sha...master" --jq '.status')
+            if [[ "$relation" != "ahead" && "$relation" != "identical" ]]; then
+              echo "::error::Replacement source is not in master history."
+              exit 1
+            fi
+          fi
+
           TAGS="${DOCKER_IMAGE}:${VERSION}"
           if [[ "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\-[0-9]{1,3}$ ]]; then
             REALEASE_TAG=true
