@@ -529,7 +529,7 @@ jobs:
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           ALLOW_TAG_REPLACEMENT: ${{ inputs.allow_tag_replacement }}
           VALIDATION_MODE: ${{ steps.validate.outputs.mode }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
+          RELEASE_WORKFLOW_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
@@ -538,7 +538,7 @@ jobs:
           if [[ "$VALIDATION_MODE" == "replace_tagged" ]]; then
             replacement_effective=true
           fi
-          PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA-$GITHUB_RUN_ID"
+          PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA-$RELEASE_WORKFLOW_RUN_ID"
           PUBLISH_TITLE="Docker Image CI $PUBLISH_ID"
 
           # Check tag history before any dispatch, then locate an existing
