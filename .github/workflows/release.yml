@@ -142,6 +142,10 @@ jobs:
               echo "::error::Could not safely determine whether the tag exists."
               exit 1
             fi
+            if [[ "$ALLOW_TAG_REPLACEMENT" == "true" ]]; then
+              echo "::error::Cannot replace $RELEASE_TAG because its tag does not exist."
+              exit 1
+            fi
 
             owner=$(gh api "$API" --jq '.owner.login')
             merged_prs=$(gh api --paginate --method GET "$API/pulls" \
