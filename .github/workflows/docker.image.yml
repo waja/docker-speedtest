@@ -27,6 +27,11 @@ on:
         required: false
         type: string
         default: ""
+      replacement:
+        description: "Republish an existing release tag without moving latest"
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
       - $default-branch
@@ -40,10 +45,16 @@ on:
     - cron: "43 10 * * 4"
 
 # Prevent two runs for the same branch or tag from publishing concurrently.
+# Tag pushes and explicit publications must not replace one another while
+# waiting for a concurrency slot. Release requests are queued by release.yml.
 concurrency:
   group: >-
-    docker-image-${{ inputs.publish == false && inputs.test_id ||
-      inputs.image_version || github.ref_name }}
+    docker-image-${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') &&
+      format('tag-push-{0}', github.ref_name) ||
+      (inputs.publish == false && inputs.test_id) ||
+      (inputs.test_id && format('dispatch-{0}', inputs.test_id)) ||
+      (inputs.image_version && format('release-publish-{0}', inputs.image_version)) ||
+      github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -75,7 +86,10 @@ jobs:
     name: shiftleft
     outputs:
       build_date: ${{ steps.metadata.outputs.build_date }}
+      build_version: ${{ steps.metadata.outputs.build_version }}
+      vcs_ref: ${{ steps.metadata.outputs.vcs_ref }}
       vcs_url: ${{ steps.metadata.outputs.vcs_url }}
+      vcs_branch: ${{ steps.metadata.outputs.vcs_branch }}
     strategy:
       fail-fast: false
     runs-on: ubuntu-latest
@@ -84,13 +98,36 @@ jobs:
         with:
           ref: ${{ inputs.source_ref || (github.event_name == 'pull_request' && github.sha) || github.ref }}
           fetch-depth: 0
+      - name: Checkout workflow tools
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
+          path: .workflow-tools
+          fetch-depth: 0
+
       - name: Prepare image metadata
         id: metadata
+        env:
+          BUILD_VERSION_INPUT: ${{ inputs.image_version }}
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+          HEAD_REF_INPUT: ${{ github.head_ref }}
+          REF_NAME_INPUT: ${{ github.ref_name }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            vcs_branch="$HEAD_REF_INPUT"
+          else
+            vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
+          fi
+
           {
             echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
+            echo "vcs_ref=$(git rev-parse --short HEAD)"
             echo "vcs_url=$(git config --get remote.origin.url)"
+            echo "vcs_branch=$vcs_branch"
           } >> "$GITHUB_OUTPUT"
 
       - name: Perform ShiftLeft Scan
@@ -399,11 +436,30 @@ jobs:
           SOURCE_REF_INPUT: ${{ inputs.source_ref }}
           IMAGE_VERSION_INPUT: ${{ inputs.image_version }}
           PUBLISH_INPUT: ${{ inputs.publish }}
+          REPLACEMENT_INPUT: ${{ inputs.replacement }}
+          EVENT_NAME_INPUT: ${{ github.event_name }}
+          EVENT_REF_INPUT: ${{ github.ref }}
+          EVENT_BEFORE_INPUT: ${{ github.event.before }}
           QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
         run: |
           USER="${GITHUB_REPOSITORY_OWNER}"
-          IMAGE_NAME="$(echo '${{ github.repository }}' | awk -F '/' '{print $2}' | sed  s/docker-//)"
+          case "$REPLACEMENT_INPUT" in
+            true|false|"") ;;
+            *) echo "::error::Invalid replacement input."; exit 1 ;;
+          esac
+          replacement_effective=false
+          if [[ "$REPLACEMENT_INPUT" == "true" ]]; then
+            replacement_effective=true
+          elif [[ "$EVENT_NAME_INPUT" == "push" &&
+                  "$EVENT_REF_INPUT" == refs/tags/* &&
+                  -n "$EVENT_BEFORE_INPUT" &&
+                  "$EVENT_BEFORE_INPUT" != "0000000000000000000000000000000000000000" ]]; then
+            # A force-update of an existing tag is a replacement, not a new
+            # release. The release workflow performs the explicit publication.
+            replacement_effective=true
+          fi
+          IMAGE_NAME="$(echo "$GITHUB_REPOSITORY" | awk -F '/' '{print $2}' | sed  s/docker-//)"
           DOCKER_IMAGE="${USER}/${IMAGE_NAME}"
           VERSION=edge
           # running on a tag
@@ -428,28 +484,93 @@ jobs:
           if [[ -n "$IMAGE_VERSION_INPUT" ]]; then
             VERSION="$IMAGE_VERSION_INPUT"
           fi
+
+          # The replacement bypass is restricted to the validated release
+          # workflow and re-checks the tag/source relationship independently.
+          if [[ "$REPLACEMENT_INPUT" == "true" ]]; then
+            release_tag_pattern='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$'
+            if [[ "$EVENT_NAME_INPUT" != "workflow_dispatch" ||
+                  ! "$VERSION" =~ $release_tag_pattern ||
+                  -z "$SOURCE_REF_INPUT" ]]; then
+              echo "::error::Replacement requires workflow_dispatch, a valid release tag, and an explicit source_ref."
+              exit 1
+            fi
+
+            source_sha=$(git rev-parse HEAD)
+            tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION")
+            tag_type=$(jq -r '.object.type' <<< "$tag_json")
+            tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+            while [[ "$tag_type" == "tag" ]]; do
+              tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")
+              tag_type=$(jq -r '.object.type' <<< "$tag_json")
+              tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+            done
+            if [[ "$tag_type" != "commit" || "$tag_sha" != "$source_sha" ]]; then
+              echo "::error::Replacement tag $VERSION must point to tested source $source_sha."
+              exit 1
+            fi
+
+            relation=$(gh api "repos/$GITHUB_REPOSITORY/compare/$source_sha...master" --jq '.status')
+            if [[ "$relation" != "ahead" && "$relation" != "identical" ]]; then
+              echo "::error::Replacement source is not in master history."
+              exit 1
+            fi
+          fi
           TAGS="${DOCKER_IMAGE}:${VERSION}"
           if [[ "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\-[0-9]{1,3}$ ]]; then
             REALEASE_TAG=true
           fi
+          # A deleted and recreated release tag has an all-zero push "before"
+          # SHA. Check publication history so recreating an older version cannot
+          # move the floating latest tag backwards.
+          if [[ "$EVENT_NAME_INPUT" == "push" && "$EVENT_REF_INPUT" == refs/tags/* &&
+                "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$ ]]; then
+            if prior_runs=$(gh api --paginate --method GET \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/docker.image.yml/runs" \
+              -F per_page=100 \
+              --jq '.workflow_runs[] | {id,event,head_sha,head_branch,display_title,conclusion,created_at}'); then
+              if prior_other_sha=$(jq -s -r --arg tag "$VERSION" --arg sha "$GITHUB_SHA" --argjson current "$GITHUB_RUN_ID" '
+                [.[] | select(.id != $current and .conclusion == "success" and
+                  ((.head_branch == $tag and (.event == "push" or .event == "workflow_dispatch")) or
+                   ((.display_title // "") | startswith("Docker Image CI release-publish-" + $tag + "-"))))
+                  | (if ((.display_title // "") | startswith("Docker Image CI release-publish-" + $tag + "-"))
+                     then .display_title[("Docker Image CI release-publish-" | length) + ($tag | length) + 1:][:40]
+                     else .head_sha end)]
+                | any(. != $sha) ' <<< "$prior_runs"); then
+                if [[ "$prior_other_sha" == "true" ]]; then
+                  replacement_effective=true
+                  echo "::notice::This release tag has prior publication history at another commit; leaving latest unchanged."
+                fi
+              else
+                replacement_effective=true
+                echo "::warning::Could not parse publication history; leaving latest unchanged."
+              fi
+            else
+              # A history lookup failure must never be interpreted as proof
+              # that a recreated tag is a new release.
+              replacement_effective=true
+              echo "::warning::Could not fetch publication history; leaving latest unchanged."
+            fi
+          fi
+
           TAGS_INT="$TAGS"
           TAGS=""
           if [ "$DOCKERHUB_USERNAME" != '' ] && [ "$DOCKERHUB_TOKEN" != '' ]; then
-            if [ "$REALEASE_TAG" = "true" ]; then
+            if [ "$REALEASE_TAG" = "true" ] && [[ "$replacement_effective" != "true" ]]; then
               TAGS="$TAGS_INT,${DOCKER_IMAGE}:latest"
             else
               TAGS="$TAGS_INT"
             fi
           fi
           if [ "$GITHUB_TOKEN" != '' ]; then
-            if [ "$REALEASE_TAG" = "true" ]; then
+            if [ "$REALEASE_TAG" = "true" ] && [[ "$replacement_effective" != "true" ]]; then
               TAGS="$TAGS,ghcr.io/$TAGS_INT,ghcr.io/${DOCKER_IMAGE}:latest"
             else
               TAGS="$TAGS,ghcr.io/$TAGS_INT"
             fi
           fi
           if [ "$QUAY_USERNAME" != '' ] && [ "$QUAY_TOKEN" != '' ]; then
-            if [ "$REALEASE_TAG" = "true" ]; then
+            if [ "$REALEASE_TAG" = "true" ] && [[ "$replacement_effective" != "true" ]]; then
               TAGS="$TAGS,quay.io/$TAGS_INT,quay.io/${DOCKER_IMAGE}:latest"
             else
               TAGS="$TAGS,quay.io/$TAGS_INT"
@@ -457,10 +578,9 @@ jobs:
           fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
           echo "skip_publish=false" >> "$GITHUB_OUTPUT"
-
           # Workflow-level concurrency serializes runs for this ref. A second
           # run must also avoid publishing if an earlier run already succeeded.
-          if [[ "$PUBLISH_INPUT" != "false" && \
+          if [[ "$PUBLISH_INPUT" != "false" && "$replacement_effective" != "true" && \
                 "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$ ]]; then
             source_sha="${SOURCE_REF_INPUT:-$GITHUB_SHA}"
             publish_title="Docker Image CI release-publish-$VERSION-$source_sha"
@@ -485,6 +605,16 @@ jobs:
               echo "skip_publish=true" >> "$GITHUB_OUTPUT"
             fi
           fi
+
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.IMAGE_NAME }}-${{ github.run_number }}
+          path: /tmp
+
+      - name: Load image from test job
+        run: |
+          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_number }}.tar
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
