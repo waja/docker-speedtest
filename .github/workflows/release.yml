@@ -501,13 +501,12 @@ jobs:
           fi
 
           if [[ "$VALIDATION_MODE" == "replace_tagged" ]]; then
-            current_tag_ref_sha=$(gh api "$API/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')
-            if [[ "$current_tag_ref_sha" != "$EXPECTED_TAG_REF_SHA" ]]; then
-              echo "::error::Tag $RELEASE_TAG changed after validation; refusing to overwrite the concurrent update."
-              exit 1
-            fi
-            gh api --method PATCH "$API/git/refs/tags/$RELEASE_TAG" \
-              -f "sha=$RELEASE_SHA" -F force=true
+            # GitHub's REST ref PATCH has no compare-and-swap condition.
+            # Use Git's force-with-lease so the server atomically rejects the
+            # update if the tag no longer points at the validated ref object.
+            git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" \
+              push --force-with-lease="refs/tags/$RELEASE_TAG:$EXPECTED_TAG_REF_SHA" \
+              origin "$RELEASE_SHA:refs/tags/$RELEASE_TAG"
             echo "Moved $RELEASE_TAG to tested commit $RELEASE_SHA."
           else
             # The tag was absent during validation. POST cannot overwrite it.
