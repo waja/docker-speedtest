@@ -504,8 +504,7 @@ jobs:
             # GitHub's REST ref PATCH has no compare-and-swap condition.
             # Use Git's force-with-lease so the server atomically rejects the
             # update if the tag no longer points at the validated ref object.
-            git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" \
-              push --force-with-lease="refs/tags/$RELEASE_TAG:$EXPECTED_TAG_REF_SHA" \
+            git push --force-with-lease="refs/tags/$RELEASE_TAG:$EXPECTED_TAG_REF_SHA" \
               origin "$RELEASE_SHA:refs/tags/$RELEASE_TAG"
             echo "Moved $RELEASE_TAG to tested commit $RELEASE_SHA."
           else
