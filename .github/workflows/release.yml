@@ -121,7 +121,9 @@ jobs:
 
           tag_file=$(mktemp)
           tag_error=$(mktemp)
+          tag_ref_sha=
           if gh api "$API/git/ref/tags/$RELEASE_TAG" >"$tag_file" 2>"$tag_error"; then
+            tag_ref_sha=$(jq -r '.object.sha' < "$tag_file")
             if [[ "$ALLOW_TAG_REPLACEMENT" == "true" ]]; then
               release_sha=$(gh api "$API/git/ref/heads/master" --jq '.object.sha')
               assert_on_master_history "$release_sha"
@@ -175,6 +177,7 @@ jobs:
           {
             echo "mode=$mode"
             echo "release_sha=$release_sha"
+            echo "tag_ref_sha=$tag_ref_sha"
           } >> "$GITHUB_OUTPUT"
 
       - name: Prepare release pull request
@@ -473,7 +476,7 @@ jobs:
           set -euo pipefail
           API="repos/$REPOSITORY"
           bash .github/scripts/wait-for-workflow-run.sh \
-            "$API" "$RUN_ID" "$DISPLAY_TITLE" "$DISPATCHED_AT" 5400
+            "$API" "$RUN_ID" "$DISPLAY_TITLE" "$DISPATCHED_AT" 5400 "$PUBLISH_ID"
 
       - name: Create or replace tag only after merge-commit tests pass
         if: steps.validate.outputs.mode != 'tagged'
@@ -482,6 +485,8 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+          EXPECTED_TAG_REF_SHA: ${{ steps.validate.outputs.tag_ref_sha }}
+          VALIDATION_MODE: ${{ steps.validate.outputs.mode }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
@@ -491,7 +496,12 @@ jobs:
             exit 1
           fi
 
-          if [[ "${{ steps.validate.outputs.mode }}" == "replace_tagged" ]]; then
+          if [[ "$VALIDATION_MODE" == "replace_tagged" ]]; then
+            current_tag_ref_sha=$(gh api "$API/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')
+            if [[ "$current_tag_ref_sha" != "$EXPECTED_TAG_REF_SHA" ]]; then
+              echo "::error::Tag $RELEASE_TAG changed after validation; refusing to overwrite the concurrent update."
+              exit 1
+            fi
             gh api --method PATCH "$API/git/refs/tags/$RELEASE_TAG" \
               -f "sha=$RELEASE_SHA" -F force=true
             echo "Moved $RELEASE_TAG to tested commit $RELEASE_SHA."
@@ -514,22 +524,28 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           ALLOW_TAG_REPLACEMENT: ${{ inputs.allow_tag_replacement }}
+          VALIDATION_MODE: ${{ steps.validate.outputs.mode }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
           DEFAULT_BRANCH=$(gh api "$API" --jq '.default_branch')
-          PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA"
+          replacement_effective=false
+          if [[ "$VALIDATION_MODE" == "replace_tagged" ]]; then
+            replacement_effective=true
+          fi
+          PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA-$GITHUB_RUN_ID"
           PUBLISH_TITLE="Docker Image CI $PUBLISH_ID"
 
           # Check tag history before any dispatch, then locate an existing
           # publication run (including older tag-ref workflow runs).
           bash .github/scripts/check-release-image-history.sh \
-            "$API" "$RELEASE_TAG" "$RELEASE_SHA" "$ALLOW_TAG_REPLACEMENT"
+            "$API" "$RELEASE_TAG" "$RELEASE_SHA" "$replacement_effective"
           run_lines=$(gh api --paginate --method GET \
             "$API/actions/workflows/docker.image.yml/runs" \
             -F per_page=100 \
             --jq '.workflow_runs[] | {id,event,head_sha,head_branch,display_title,status,conclusion,created_at,html_url}')
-          if [[ "$ALLOW_TAG_REPLACEMENT" == "true" ]]; then
+          if [[ "$replacement_effective" == "true" ]]; then
             existing=
           else
             existing=$(jq -s -c --arg sha "$RELEASE_SHA" \
@@ -559,9 +575,9 @@ jobs:
           gh workflow run docker.image.yml --repo "$REPOSITORY" \
             --ref "$DEFAULT_BRANCH" \
             -f publish=true -f source_ref="$RELEASE_SHA" \
-            -f test_id="release-publish-$RELEASE_TAG-$RELEASE_SHA" \
+            -f test_id="$PUBLISH_ID" \
             -f image_version="$RELEASE_TAG" \
-            -f replacement="$ALLOW_TAG_REPLACEMENT"
+            -f replacement="$replacement_effective"
           echo "dispatched_at=$dispatched_at" >> "$GITHUB_OUTPUT"
           echo "Started Docker image publication for $RELEASE_TAG."
 
@@ -572,8 +588,9 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           RUN_ID: ${{ steps.docker_dispatch.outputs.run_id }}
-          DISPLAY_TITLE: Docker Image CI release-publish-${{ inputs.tag }}-${{ steps.release_commit.outputs.sha }}
+          DISPLAY_TITLE: Docker Image CI release-publish-${{ inputs.tag }}-${{ steps.release_commit.outputs.sha }}-${{ github.run_id }}
           DISPATCHED_AT: ${{ steps.docker_dispatch.outputs.dispatched_at }}
+          PUBLISH_ID: release-publish-${{ inputs.tag }}-${{ steps.release_commit.outputs.sha }}-${{ github.run_id }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
