@@ -8,6 +8,7 @@ RUN_ID="${2:-}"
 DISPLAY_TITLE="${3:?Workflow run title required}"
 DISPATCHED_AT="${4:-}"
 TIMEOUT_SECONDS="${5:-5400}"
+TEST_ID="${6:-}"
 deadline=$((SECONDS + TIMEOUT_SECONDS))
 
 while ((SECONDS < deadline)); do
@@ -20,8 +21,9 @@ while ((SECONDS < deadline)); do
 			--jq '.workflow_runs[] |
         {id,event,display_title,status,conclusion,created_at,html_url}')
 		run=$(jq -s -c --arg title "$DISPLAY_TITLE" \
-			--arg since "$DISPATCHED_AT" '
+			--arg since "$DISPATCHED_AT" --arg test_id "$TEST_ID" '
         [.[] | select(.display_title == $title
+          and (.display_title | endswith($test_id))
           and .created_at >= $since)]
         | sort_by(.created_at) | last // empty
       ' <<<"$run_lines")

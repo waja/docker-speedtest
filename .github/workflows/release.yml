@@ -10,7 +10,7 @@ on:
         required: true
         type: string
       allow_tag_replacement:
-        description: "Allow republishing this tag from a different commit (overwrites published tag contents)"
+        description: "Replace this tag with the current master commit and republish it (does not update latest)"
         required: false
         type: boolean
         default: false
@@ -75,9 +75,14 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.tag }}
           REPOSITORY: ${{ github.repository }}
+          ALLOW_TAG_REPLACEMENT: ${{ inputs.allow_tag_replacement }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
+          case "$ALLOW_TAG_REPLACEMENT" in
+            true|false) ;;
+            *) echo "::error::Invalid allow_tag_replacement input."; exit 1 ;;
+          esac
 
           # This project's tags use version-build names such as 2.1.3-35.
           tag_pattern='^[0-9]{1,3}\.[0-9]{1,3}\.'
@@ -116,11 +121,20 @@ jobs:
 
           tag_file=$(mktemp)
           tag_error=$(mktemp)
+          tag_ref_sha=
           if gh api "$API/git/ref/tags/$RELEASE_TAG" >"$tag_file" 2>"$tag_error"; then
-            release_sha=$(resolve_tag_commit "$(cat "$tag_file")")
-            assert_on_master_history "$release_sha"
-            mode=tagged
-            echo "Existing tag $RELEASE_TAG resolves to $release_sha."
+            tag_ref_sha=$(jq -r '.object.sha' < "$tag_file")
+            if [[ "$ALLOW_TAG_REPLACEMENT" == "true" ]]; then
+              release_sha=$(gh api "$API/git/ref/heads/master" --jq '.object.sha')
+              assert_on_master_history "$release_sha"
+              mode=replace_tagged
+              echo "Replacement requested: $RELEASE_TAG will use current master commit $release_sha."
+            else
+              release_sha=$(resolve_tag_commit "$(cat "$tag_file")")
+              assert_on_master_history "$release_sha"
+              mode=tagged
+              echo "Existing tag $RELEASE_TAG resolves to $release_sha."
+            fi
           else
             # Only a genuine 404 means the tag is absent. Auth, API and
             # network failures must stop before a merge can occur.
@@ -163,6 +177,7 @@ jobs:
           {
             echo "mode=$mode"
             echo "release_sha=$release_sha"
+            echo "tag_ref_sha=$tag_ref_sha"
           } >> "$GITHUB_OUTPUT"
 
       - name: Prepare release pull request
@@ -399,11 +414,15 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
-          ALLOW_TAG_REPLACEMENT: ${{ inputs.allow_tag_replacement }}
+          VALIDATION_MODE: ${{ steps.validate.outputs.mode }}
         run: |
           set -euo pipefail
+          replacement_effective=false
+          if [[ "$VALIDATION_MODE" == "replace_tagged" ]]; then
+            replacement_effective=true
+          fi
           bash .github/scripts/check-release-image-history.sh \
-            "repos/$REPOSITORY" "$RELEASE_TAG" "$RELEASE_SHA" "$ALLOW_TAG_REPLACEMENT"
+            "repos/$REPOSITORY" "$RELEASE_TAG" "$RELEASE_SHA" "$replacement_effective"
 
       - name: Start or reuse tests for the resulting merge commit
         id: test_dispatch
@@ -463,13 +482,16 @@ jobs:
           bash .github/scripts/wait-for-workflow-run.sh \
             "$API" "$RUN_ID" "$DISPLAY_TITLE" "$DISPATCHED_AT" 5400
 
-      - name: Create tag only after merge-commit tests pass
+      - name: Create or replace tag only after merge-commit tests pass
         if: steps.validate.outputs.mode != 'tagged'
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          TAG_PUSH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
+          EXPECTED_TAG_REF_SHA: ${{ steps.validate.outputs.tag_ref_sha }}
+          VALIDATION_MODE: ${{ steps.validate.outputs.mode }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
@@ -479,15 +501,28 @@ jobs:
             exit 1
           fi
 
-          # The tag was absent during validation. This POST cannot overwrite
-          # an existing ref; on a race, fail and retry through tag recovery.
-          if ! gh api --method POST "$API/git/refs" \
-            -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$RELEASE_SHA"; then
-            echo "::error::Could not create the release tag."
-            echo "The tag may have been created concurrently; retry to resume."
-            exit 1
+          if [[ "$VALIDATION_MODE" == "replace_tagged" ]]; then
+            # GitHub's REST ref PATCH has no compare-and-swap condition.
+            # Use Git's force-with-lease so the server atomically rejects the
+            # update if the tag no longer points at the validated ref object.
+            # Use GITHUB_TOKEN for tag mutations so this release's own
+            # replacement does not trigger a competing tag-push publisher.
+            # Independent tag pushes using a separate credential still trigger
+            # the Docker workflow as usual.
+            git -c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TAG_PUSH_TOKEN" | base64 -w0)" \
+              push --force-with-lease="refs/tags/$RELEASE_TAG:$EXPECTED_TAG_REF_SHA" \
+              origin "$RELEASE_SHA:refs/tags/$RELEASE_TAG"
+            echo "Moved $RELEASE_TAG to tested commit $RELEASE_SHA."
+          else
+            # The tag was absent during validation. POST cannot overwrite it.
+            if ! GH_TOKEN="$TAG_PUSH_TOKEN" gh api --method POST "$API/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$RELEASE_SHA"; then
+              echo "::error::Could not create the release tag."
+              echo "The tag may have been created concurrently; retry to resume."
+              exit 1
+            fi
+            echo "Created $RELEASE_TAG at tested commit $RELEASE_SHA."
           fi
-          echo "Created $RELEASE_TAG at tested commit $RELEASE_SHA."
 
       - name: Start or resume Docker image publication
         id: docker_dispatch
@@ -497,31 +532,36 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           ALLOW_TAG_REPLACEMENT: ${{ inputs.allow_tag_replacement }}
+          VALIDATION_MODE: ${{ steps.validate.outputs.mode }}
+          RELEASE_WORKFLOW_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
           DEFAULT_BRANCH=$(gh api "$API" --jq '.default_branch')
-          PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA"
+          replacement_effective=false
+          if [[ "$VALIDATION_MODE" == "replace_tagged" ]]; then
+            replacement_effective=true
+          fi
+          PUBLISH_ID="release-publish-$RELEASE_TAG-$RELEASE_SHA-$RELEASE_WORKFLOW_RUN_ID"
           PUBLISH_TITLE="Docker Image CI $PUBLISH_ID"
 
           # Check tag history before any dispatch, then locate an existing
           # publication run (including older tag-ref workflow runs).
           bash .github/scripts/check-release-image-history.sh \
-            "$API" "$RELEASE_TAG" "$RELEASE_SHA" "$ALLOW_TAG_REPLACEMENT"
+            "$API" "$RELEASE_TAG" "$RELEASE_SHA" "$replacement_effective"
           run_lines=$(gh api --paginate --method GET \
             "$API/actions/workflows/docker.image.yml/runs" \
             -F per_page=100 \
             --jq '.workflow_runs[] | {id,event,head_sha,head_branch,display_title,status,conclusion,created_at,html_url}')
-          existing=$(jq -s -c --arg sha "$RELEASE_SHA" \
-            --arg tag "$RELEASE_TAG" --arg title "$PUBLISH_TITLE" '
-              [.[] | select(
-                (.display_title == $title)
-                or ((.head_branch == $tag)
-                  and .head_sha == $sha
-                  and (.event == "push" or .event == "workflow_dispatch"))
-              )]
-              | sort_by(.created_at) | last // empty
-            ' <<< "$run_lines")
+          if [[ "$replacement_effective" == "true" ]]; then
+            existing=
+          else
+            existing=$(jq -s -c --arg sha "$RELEASE_SHA" \
+              --arg tag "$RELEASE_TAG" --arg title "$PUBLISH_TITLE" '
+                [.[] | select(.display_title == $title)]
+                | sort_by(.created_at) | last // empty
+              ' <<< "$run_lines")
+          fi
           if [[ -n "$existing" ]]; then
             status=$(jq -r '.status' <<< "$existing")
             conclusion=$(jq -r '.conclusion // empty' <<< "$existing")
@@ -538,7 +578,9 @@ jobs:
           gh workflow run docker.image.yml --repo "$REPOSITORY" \
             --ref "$DEFAULT_BRANCH" \
             -f publish=true -f source_ref="$RELEASE_SHA" \
-            -f test_id="$PUBLISH_ID" -f image_version="$RELEASE_TAG"
+            -f test_id="$PUBLISH_ID" \
+            -f image_version="$RELEASE_TAG" \
+            -f replacement="$replacement_effective"
           echo "dispatched_at=$dispatched_at" >> "$GITHUB_OUTPUT"
           echo "Started Docker image publication for $RELEASE_TAG."
 
@@ -549,13 +591,14 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_SHA: ${{ steps.release_commit.outputs.sha }}
           RUN_ID: ${{ steps.docker_dispatch.outputs.run_id }}
-          DISPLAY_TITLE: Docker Image CI release-publish-${{ inputs.tag }}-${{ steps.release_commit.outputs.sha }}
+          DISPLAY_TITLE: Docker Image CI release-publish-${{ inputs.tag }}-${{ steps.release_commit.outputs.sha }}-${{ github.run_id }}
           DISPATCHED_AT: ${{ steps.docker_dispatch.outputs.dispatched_at }}
+          PUBLISH_ID: release-publish-${{ inputs.tag }}-${{ steps.release_commit.outputs.sha }}-${{ github.run_id }}
         run: |
           set -euo pipefail
           API="repos/$REPOSITORY"
           bash .github/scripts/wait-for-workflow-run.sh \
-            "$API" "$RUN_ID" "$DISPLAY_TITLE" "$DISPATCHED_AT" 5400
+            "$API" "$RUN_ID" "$DISPLAY_TITLE" "$DISPATCHED_AT" 5400 "$PUBLISH_ID"
 
       - name: Open back-merge PR if master has changes
         env:
