@@ -32,7 +32,7 @@ fi
 
 latest_sha=$(jq -r --arg prefix "$PUBLISH_PREFIX" '
   if ((.display_title // "") | startswith($prefix))
-  then .display_title[($prefix | length):]
+  then .display_title[($prefix | length):][:40]
   else .head_sha end
 ' <<<"$latest")
 
