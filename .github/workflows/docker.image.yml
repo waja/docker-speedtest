@@ -370,7 +370,7 @@ jobs:
           if [[ -n "$VARIANT" ]]; then
             args+=(--override-variant "$VARIANT")
           fi
-          skopeo "${args[@]}" copy \
+          skopeo copy --dest-tls-verify=false "${args[@]}" \
             "oci-archive:${ARCHIVE}:latest" \
             "docker://localhost:5000/foobar/${IMAGE_NAME}:${PLATFORM_TAG}"
       - name: Run platform smoke test
@@ -382,7 +382,7 @@ jobs:
           docker pull --platform "$PLATFORM" "localhost:5000/foobar/${IMAGE_NAME}:$PLATFORM_TAG"
           output=$(docker run --rm --platform "$PLATFORM" \
             "localhost:5000/foobar/${IMAGE_NAME}:$PLATFORM_TAG" -h)
-          first_line=$(printf '%s\\n' "$output" | head -1)
+          first_line=$(printf '%s\n' "$output" | head -1)
           if [[ "$first_line" != *"speedtest-cli"* ]]; then
             echo "::error::Unexpected output for $PLATFORM: $output"
             exit 1
@@ -889,7 +889,7 @@ jobs:
           fi
 
           published_versions=$(bash .workflow-tools/.github/scripts/list-published-release-versions.sh "$API")
-          highest_prior=$(printf '%s\n' "$published_versions" | sort -V | tail -n1)
+          highest_prior=$(printf '%s\\n' "$published_versions" | sort -V | tail -n1)
           if [[ -n "$highest_prior" ]]; then
             lowest=$(printf '%s\n%s\n' "$RELEASE_TAG" "$highest_prior" | sort -V | head -n1)
             if [[ "$RELEASE_TAG" != "$highest_prior" && "$lowest" == "$RELEASE_TAG" ]]; then
