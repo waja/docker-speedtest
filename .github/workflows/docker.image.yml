@@ -559,7 +559,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          tag_pattern='^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}-[0-9]{1,3}$'
+          tag_pattern='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$'
           if [[ ! "$RELEASE_TAG" =~ $tag_pattern || -z "$SOURCE_REF_INPUT" ]]; then
             echo "::error::Tag creation requires a valid release tag and explicit source_ref."
             exit 1
@@ -597,8 +597,8 @@ jobs:
               fi
               if [[ "$tag_commit_sha" != "$SOURCE_SHA" ]]; then
                 auth=$(printf 'x-access-token:%s' "$TAG_PUSH_TOKEN" | base64 -w0)
-                git -c "http.extraheader=AUTHORIZATION: basic $auth" \\
-                  push --force-with-lease="refs/tags/$RELEASE_TAG:$EXPECTED_TAG_REF_SHA" \\
+                git -c "http.extraheader=AUTHORIZATION: basic $auth" \
+                  push --force-with-lease="refs/tags/$RELEASE_TAG:$EXPECTED_TAG_REF_SHA" \
                   origin "$SOURCE_SHA:refs/tags/$RELEASE_TAG"
                 echo "Moved $RELEASE_TAG to tested commit $SOURCE_SHA."
               else
@@ -620,7 +620,7 @@ jobs:
               echo "::error::Could not safely determine whether the release tag exists."
               exit 1
             fi
-            if ! GH_TOKEN="$TAG_PUSH_TOKEN" gh api --method POST "repos/$REPOSITORY/git/refs" \\
+            if ! GH_TOKEN="$TAG_PUSH_TOKEN" gh api --method POST "repos/$REPOSITORY/git/refs" \
               -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$SOURCE_SHA"; then
               echo "::error::Could not create the release tag."
               exit 1
