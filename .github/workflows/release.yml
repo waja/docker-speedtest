@@ -491,8 +491,8 @@ jobs:
             -f publish=true -f source_ref="$RELEASE_SHA" \
             -f test_id="$PUBLISH_TEST_ID" \
             -f image_version="$RELEASE_TAG" \
-            -f replacement="$replacement_effective" \\
-            -f create_release_tag="$([[ "$RELEASE_MODE" == "tagged" ]] && echo false || echo true)" \\
+            -f replacement="$replacement_effective" \
+            -f create_release_tag="$([[ "$RELEASE_MODE" == "tagged" ]] && echo false || echo true)" \
             -f expected_tag_ref_sha="${{ steps.validate.outputs.tag_ref_sha }}"
           echo "dispatched_at=$dispatched_at" >> "$GITHUB_OUTPUT"
           echo "Started Docker image publication for $RELEASE_TAG."
