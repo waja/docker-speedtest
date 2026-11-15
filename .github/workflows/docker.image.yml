@@ -147,6 +147,10 @@ jobs:
       - shiftleft
     outputs:
       tested_sha: ${{ steps.build_metadata.outputs.vcs_sha }}
+      build_version: ${{ steps.build_metadata.outputs.build_version }}
+      vcs_ref: ${{ steps.build_metadata.outputs.vcs_ref }}
+      vcs_url: ${{ steps.build_metadata.outputs.vcs_url }}
+      vcs_branch: ${{ steps.build_metadata.outputs.vcs_branch }}
     strategy:
       fail-fast: false
     runs-on: ubuntu-latest
@@ -183,6 +187,7 @@ jobs:
             echo "vcs_sha=$(git rev-parse HEAD)"
             echo "vcs_ref=$(git rev-parse --short HEAD)"
             echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
+            echo "vcs_url=$(git config --get remote.origin.url)"
             echo "vcs_branch=$vcs_branch"
           } >> "$GITHUB_OUTPUT"
 
@@ -208,7 +213,7 @@ jobs:
             BUILD_DATE=${{ needs.shiftleft.outputs.build_date }}
             BUILD_VERSION=${{ steps.build_metadata.outputs.build_version }}
             VCS_REF=${{ steps.build_metadata.outputs.vcs_ref }}
-            VCS_URL=${{ needs.shiftleft.outputs.vcs_url }}
+            VCS_URL=${{ steps.build_metadata.outputs.vcs_url }}
             VCS_BRANCH=${{ steps.build_metadata.outputs.vcs_branch }}
       - name: Upload single-platform test image
         uses: actions/upload-artifact@v7
@@ -301,10 +306,10 @@ jobs:
           platforms: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64
           build-args: |
             BUILD_DATE=${{ needs.shiftleft.outputs.build_date }}
-            BUILD_VERSION=${{ needs.shiftleft.outputs.build_version }}
-            VCS_REF=${{ needs.shiftleft.outputs.vcs_ref }}
-            VCS_URL=${{ needs.shiftleft.outputs.vcs_url }}
-            VCS_BRANCH=${{ needs.shiftleft.outputs.vcs_branch }}
+            BUILD_VERSION=${{ needs.test-build.outputs.build_version }}
+            VCS_REF=${{ needs.test-build.outputs.vcs_ref }}
+            VCS_URL=${{ needs.test-build.outputs.vcs_url }}
+            VCS_BRANCH=${{ needs.test-build.outputs.vcs_branch }}
       - name: Upload multi-platform OCI image
         uses: actions/upload-artifact@v7
         with:
@@ -826,7 +831,8 @@ jobs:
           username: ${{ env.QUAY_USERNAME }}
           password: ${{ env.QUAY_TOKEN }}
 
-      - name: Publish tested OCI image to configured registries
+      # Keep this step name stable: release-history scripts use it to detect publication attempts.
+      - name: Build and push
         id: docker_build
         if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish) && steps.prep.outputs.tags != '' }}
         env:
@@ -889,7 +895,7 @@ jobs:
           fi
 
           published_versions=$(bash .workflow-tools/.github/scripts/list-published-release-versions.sh "$API")
-          highest_prior=$(printf '%s\\n' "$published_versions" | sort -V | tail -n1)
+          highest_prior=$(printf '%s\n' "$published_versions" | sort -V | tail -n1)
           if [[ -n "$highest_prior" ]]; then
             lowest=$(printf '%s\n%s\n' "$RELEASE_TAG" "$highest_prior" | sort -V | head -n1)
             if [[ "$RELEASE_TAG" != "$highest_prior" && "$lowest" == "$RELEASE_TAG" ]]; then
