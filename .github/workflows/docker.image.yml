@@ -1,7 +1,8 @@
 ---
 name: Docker Image CI
 
-run-name: Docker Image CI ${{ inputs.test_id || inputs.image_version || github.ref_name }}
+run-name: >-
+  Docker Image CI ${{ (github.event_name == 'workflow_dispatch' && inputs.publish == false && format('test-{0}', inputs.test_id || inputs.image_version || github.ref_name)) || inputs.test_id || (github.event_name == 'workflow_dispatch' && inputs.publish == true && inputs.image_version != '' && format('release-publish-{0}-{1}', inputs.image_version, github.sha)) || inputs.image_version || github.ref_name }}
 
 # checkov:skip=CKV_GHA_7: The release workflow needs test-only workflow inputs.
 on:
@@ -27,6 +28,11 @@ on:
         required: false
         type: string
         default: ""
+      replacement:
+        description: "Republish an existing release tag without moving latest"
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
       - $default-branch
@@ -39,12 +45,12 @@ on:
   schedule:
     - cron: "43 10 * * 4"
 
-# Prevent two runs for the same branch or tag from publishing concurrently.
+# Serialize publication of the same image version. Different versions may
+# publish concurrently; the latest-version guard below minimizes stale updates.
 concurrency:
-  group: >-
-    docker-image-${{ inputs.publish == false && inputs.test_id ||
-      inputs.image_version || github.ref_name }}
+  group: docker-image-${{ github.event_name == 'workflow_dispatch' && inputs.publish == false && (inputs.test_id || github.run_id) || inputs.image_version || github.ref_name }}
   cancel-in-progress: false
+  queue: max
 
 env:
   IMAGE_NAME: speedtest
@@ -68,6 +74,7 @@ jobs:
         env:
           DEFAULT_BRANCH: master
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTIONS_CONFIG_FILE: actionlint.yml
           VALIDATE_GITHUB_ACTIONS_ZIZMOR: false
           VALIDATE_TRIVY: false
           VALIDATE_BIOME_FORMAT: false
@@ -75,7 +82,10 @@ jobs:
     name: shiftleft
     outputs:
       build_date: ${{ steps.metadata.outputs.build_date }}
+      build_version: ${{ steps.metadata.outputs.build_version }}
+      vcs_ref: ${{ steps.metadata.outputs.vcs_ref }}
       vcs_url: ${{ steps.metadata.outputs.vcs_url }}
+      vcs_branch: ${{ steps.metadata.outputs.vcs_branch }}
     strategy:
       fail-fast: false
     runs-on: ubuntu-latest
@@ -84,13 +94,36 @@ jobs:
         with:
           ref: ${{ inputs.source_ref || (github.event_name == 'pull_request' && github.sha) || github.ref }}
           fetch-depth: 0
+      - name: Checkout workflow tools
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .workflow-tools
+          fetch-depth: 0
+
       - name: Prepare image metadata
         id: metadata
+        env:
+          BUILD_VERSION_INPUT: ${{ inputs.image_version }}
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+          HEAD_REF_INPUT: ${{ github.head_ref }}
+          REF_NAME_INPUT: ${{ github.ref_name }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            vcs_branch="$HEAD_REF_INPUT"
+          else
+            vcs_branch="$(bash .workflow-tools/.github/scripts/resolve-vcs-branch.sh)"
+          fi
+
           {
             echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
+            echo "vcs_ref=$(git rev-parse --short HEAD)"
             echo "vcs_url=$(git config --get remote.origin.url)"
+            echo "vcs_branch=$vcs_branch"
           } >> "$GITHUB_OUTPUT"
 
       - name: Perform ShiftLeft Scan
@@ -114,18 +147,22 @@ jobs:
       - shiftleft
     outputs:
       tested_sha: ${{ steps.build_metadata.outputs.vcs_sha }}
+      build_version: ${{ steps.build_metadata.outputs.build_version }}
+      vcs_ref: ${{ steps.build_metadata.outputs.vcs_ref }}
+      vcs_url: ${{ steps.build_metadata.outputs.vcs_url }}
+      vcs_branch: ${{ steps.build_metadata.outputs.vcs_branch }}
     strategy:
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.source_ref || (github.event_name == 'pull_request' && github.sha) || github.ref }}
+          ref: ${{ inputs.source_ref || ((github.event_name == 'pull_request' || github.event_name == 'push') && github.sha) || github.ref }}
           fetch-depth: 0
       - name: Checkout workflow tools
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           path: .workflow-tools
           fetch-depth: 0
 
@@ -150,6 +187,7 @@ jobs:
             echo "vcs_sha=$(git rev-parse HEAD)"
             echo "vcs_ref=$(git rev-parse --short HEAD)"
             echo "build_version=${BUILD_VERSION_INPUT:-$(git describe --tags --always)}"
+            echo "vcs_url=$(git config --get remote.origin.url)"
             echo "vcs_branch=$vcs_branch"
           } >> "$GITHUB_OUTPUT"
 
@@ -158,16 +196,16 @@ jobs:
         uses: docker/setup-buildx-action@v4
         with:
           driver-opts: network=host
-      - name: Build the Docker image
-        id: docker_test
+      - name: Build single-platform test image
+        id: docker_build
         uses: docker/build-push-action@v7
         with:
           builder: ${{ steps.buildx.outputs.name }}
           push: false
-          outputs: type=docker,dest=/tmp/${{ env.IMAGE_NAME }}-${{ github.run_number }}.tar
+          outputs: type=docker,dest=/tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.tar
           tags: localhost:5000/foobar/${{ env.IMAGE_NAME }}
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache
+          cache-from: type=gha,scope=speedtest
+          cache-to: type=gha,mode=max,scope=speedtest
           context: .
           file: ./Dockerfile
           platforms: linux/amd64
@@ -175,13 +213,15 @@ jobs:
             BUILD_DATE=${{ needs.shiftleft.outputs.build_date }}
             BUILD_VERSION=${{ steps.build_metadata.outputs.build_version }}
             VCS_REF=${{ steps.build_metadata.outputs.vcs_ref }}
-            VCS_URL=${{ needs.shiftleft.outputs.vcs_url }}
+            VCS_URL=${{ steps.build_metadata.outputs.vcs_url }}
             VCS_BRANCH=${{ steps.build_metadata.outputs.vcs_branch }}
-      - name: Upload artifact
+      - name: Upload single-platform test image
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.IMAGE_NAME }}-${{ github.run_number }}
-          path: /tmp/${{ env.IMAGE_NAME }}-${{ github.run_number }}.tar
+          name: ${{ env.IMAGE_NAME }}-${{ github.run_id }}
+          path: /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.tar
+          if-no-files-found: error
+          compression-level: 0
   test:
     name: Run test
     needs:
@@ -195,15 +235,14 @@ jobs:
         ports:
           - 5000:5000
     steps:
-      - name: Download artifact
+      - name: Download single-platform test image
         uses: actions/download-artifact@v8
         with:
-          name: ${{ env.IMAGE_NAME }}-${{ github.run_number }}
+          name: ${{ env.IMAGE_NAME }}-${{ github.run_id }}
           path: /tmp
-      - name: Load image and push to local registry
+      - name: Load image into local registry
         run: |
-          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_number }}.tar
-          docker image ls -a
+          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.tar
           docker push localhost:5000/foobar/${{ env.IMAGE_NAME }}
       - name: Inspect the Docker image
         run: |
@@ -221,6 +260,139 @@ jobs:
             echo "ERROR: Expected 'speedtest-cli' but got '$TEST_STRING'"
             exit 1
           fi
+  release-build:
+    name: Build multi-platform release candidate
+    needs:
+      - test-build
+      - test
+      - dockle
+      - trivy
+      - anchore
+      - shiftleft
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tested source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.test-build.outputs.tested_sha }}
+          fetch-depth: 0
+      - name: Verify tested source
+        env:
+          EXPECTED_SHA: ${{ needs.test-build.outputs.tested_sha }}
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: all
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: network=host
+      - name: Build multi-platform OCI release candidate
+        uses: docker/build-push-action@v7
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          push: false
+          outputs: type=oci,name=localhost:5000/foobar/${{ env.IMAGE_NAME }}:latest,dest=/tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.oci.tar
+          tags: localhost:5000/foobar/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha,scope=speedtest
+          cache-to: type=gha,mode=max,scope=speedtest
+          context: .
+          file: ./Dockerfile
+          platforms: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64
+          build-args: |
+            BUILD_DATE=${{ needs.shiftleft.outputs.build_date }}
+            BUILD_VERSION=${{ needs.test-build.outputs.build_version }}
+            VCS_REF=${{ needs.test-build.outputs.vcs_ref }}
+            VCS_URL=${{ needs.test-build.outputs.vcs_url }}
+            VCS_BRANCH=${{ needs.test-build.outputs.vcs_branch }}
+      - name: Upload multi-platform OCI image
+        uses: actions/upload-artifact@v7
+        with:
+          name: multiarch-${{ github.run_id }}
+          path: /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.oci.tar
+          if-no-files-found: error
+          compression-level: 0
+
+  platform-smoke:
+    name: Smoke test ${{ matrix.platform }}
+    needs:
+      - release-build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/386
+            arch: 386
+            variant: ""
+          - platform: linux/amd64
+            arch: amd64
+            variant: ""
+          - platform: linux/arm/v6
+            arch: arm
+            variant: v6
+          - platform: linux/arm/v7
+            arch: arm
+            variant: v7
+          - platform: linux/arm64
+            arch: arm64
+            variant: ""
+    runs-on: ubuntu-latest
+    services:
+      registry:
+        image: registry:3
+        ports:
+          - 5000:5000
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v7
+      - name: Download multi-platform OCI image
+        uses: actions/download-artifact@v8
+        with:
+          name: multiarch-${{ github.run_id }}
+          path: /tmp
+      - name: Install Skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes skopeo
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: all
+      - name: Select platform image from tested OCI index
+        env:
+          ARCHIVE: /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.oci.tar
+          ARCH: ${{ matrix.arch }}
+          VARIANT: ${{ matrix.variant }}
+          PLATFORM_TAG: ${{ matrix.arch }}-${{ matrix.variant || 'default' }}
+        run: |
+          set -euo pipefail
+          args=(--override-os linux --override-arch "$ARCH")
+          if [[ -n "$VARIANT" ]]; then
+            args+=(--override-variant "$VARIANT")
+          fi
+          skopeo copy --dest-tls-verify=false "${args[@]}" \
+            "oci-archive:${ARCHIVE}:latest" \
+            "docker://localhost:5000/foobar/${IMAGE_NAME}:${PLATFORM_TAG}"
+      - name: Run platform smoke test
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          PLATFORM_TAG: ${{ matrix.arch }}-${{ matrix.variant || 'default' }}
+        run: |
+          set -euo pipefail
+          docker pull --platform "$PLATFORM" "localhost:5000/foobar/${IMAGE_NAME}:$PLATFORM_TAG"
+          output=$(docker run --rm --platform "$PLATFORM" \
+            "localhost:5000/foobar/${IMAGE_NAME}:$PLATFORM_TAG" -h)
+          first_line=$(printf '%s\n' "$output" | head -1)
+          if [[ "$first_line" != *"speedtest-cli"* ]]; then
+            echo "::error::Unexpected output for $PLATFORM: $output"
+            exit 1
+          fi
+
   dockle:
     name: Run Dockle tests
     needs:
@@ -234,15 +406,14 @@ jobs:
         ports:
           - 5000:5000
     steps:
-      - name: Download artifact
+      - name: Download single-platform test image
         uses: actions/download-artifact@v8
         with:
-          name: ${{ env.IMAGE_NAME }}-${{ github.run_number }}
+          name: ${{ env.IMAGE_NAME }}-${{ github.run_id }}
           path: /tmp
-      - name: Load image and push to local registry
+      - name: Load image into local registry
         run: |
-          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_number }}.tar
-          docker image ls -a
+          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.tar
           docker push localhost:5000/foobar/${{ env.IMAGE_NAME }}
       - name: Run dockle container image linter
         uses: goodwithtech/dockle-action@v0.4.15
@@ -271,15 +442,14 @@ jobs:
         ports:
           - 5000:5000
     steps:
-      - name: Download artifact
+      - name: Download single-platform test image
         uses: actions/download-artifact@v8
         with:
-          name: ${{ env.IMAGE_NAME }}-${{ github.run_number }}
+          name: ${{ env.IMAGE_NAME }}-${{ github.run_id }}
           path: /tmp
-      - name: Load image and push to local registry
+      - name: Load image into local registry
         run: |
-          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_number }}.tar
-          docker image ls -a
+          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.tar
           docker push localhost:5000/foobar/${{ env.IMAGE_NAME }}
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@v0.36.0
@@ -306,15 +476,14 @@ jobs:
         ports:
           - 5000:5000
     steps:
-      - name: Download artifact
+      - name: Download single-platform test image
         uses: actions/download-artifact@v8
         with:
-          name: ${{ env.IMAGE_NAME }}-${{ github.run_number }}
+          name: ${{ env.IMAGE_NAME }}-${{ github.run_id }}
           path: /tmp
-      - name: Load image and push to local registry
+      - name: Load image into local registry
         run: |
-          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_number }}.tar
-          docker image ls -a
+          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.tar
           docker push localhost:5000/foobar/${{ env.IMAGE_NAME }}
       - name: Run the Anchore scan action itself with GitHub Advanced Security code scanning integration enabled
         uses: anchore/scan-action@v7.4.2
@@ -335,6 +504,8 @@ jobs:
     needs:
       - test-build
       - test
+      - release-build
+      - platform-smoke
       - dockle
       - trivy
       - anchore
@@ -359,7 +530,7 @@ jobs:
       - name: Checkout workflow tools
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.repository.default_branch || github.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           path: .workflow-tools
           fetch-depth: 0
 
@@ -399,12 +570,39 @@ jobs:
           SOURCE_REF_INPUT: ${{ inputs.source_ref }}
           IMAGE_VERSION_INPUT: ${{ inputs.image_version }}
           PUBLISH_INPUT: ${{ inputs.publish }}
+          REPLACEMENT_INPUT: ${{ inputs.replacement }}
+          TEST_ID_INPUT: ${{ inputs.test_id }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          EVENT_NAME_INPUT: ${{ github.event_name }}
+          EVENT_REF_INPUT: ${{ github.ref }}
+          EVENT_BEFORE_INPUT: ${{ github.event.before }}
           QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
         run: |
           USER="${GITHUB_REPOSITORY_OWNER}"
-          IMAGE_NAME="$(echo '${{ github.repository }}' | awk -F '/' '{print $2}' | sed  s/docker-//)"
+          case "$REPLACEMENT_INPUT" in
+            true|false|"") ;;
+            *) echo "::error::Invalid replacement input."; exit 1 ;;
+          esac
+          replacement_effective=false
+          suppress_latest=false
+          if [[ "$REPLACEMENT_INPUT" == "true" ]]; then
+            replacement_effective=true
+            suppress_latest=true
+          fi
+
+          # Direct tag pushes may create a new release, but replacements must
+          # go through release.yml so the explicit opt-in and tests are enforced.
+          if [[ "$EVENT_NAME_INPUT" == "push" && "$EVENT_REF_INPUT" == refs/tags/* ]]; then
+            if [[ "$EVENT_BEFORE_INPUT" != "0000000000000000000000000000000000000000" ]]; then
+              echo "::error::Updating an existing release tag by push is not allowed."
+              echo "Use the Release workflow with allow_tag_replacement=true."
+              exit 1
+            fi
+          fi
+          IMAGE_NAME="$(echo "$GITHUB_REPOSITORY" | awk -F '/' '{print $2}' | sed  s/docker-//)"
           DOCKER_IMAGE="${USER}/${IMAGE_NAME}"
+          REALEASE_TAG=false
           VERSION=edge
           # running on a tag
           if [[ $GITHUB_REF == refs/tags/* ]]; then
@@ -428,80 +626,179 @@ jobs:
           if [[ -n "$IMAGE_VERSION_INPUT" ]]; then
             VERSION="$IMAGE_VERSION_INPUT"
           fi
+
+          # Validate direct new-tag pushes against the actual tag target and
+          # master history. Existing-tag updates are rejected above.
+          if [[ "$EVENT_NAME_INPUT" == "push" && "$EVENT_REF_INPUT" == refs/tags/* ]]; then
+            if [[ ! "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$ ]]; then
+              echo "::error::Invalid release tag $VERSION."
+              exit 1
+            fi
+            source_sha=$(git rev-parse HEAD)
+            tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION")
+            tag_type=$(jq -r '.object.type' <<< "$tag_json")
+            tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+            while [[ "$tag_type" == "tag" ]]; do
+              tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")
+              tag_type=$(jq -r '.object.type' <<< "$tag_json")
+              tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+            done
+            if [[ "$tag_type" != "commit" || "$tag_sha" != "$source_sha" ]]; then
+              echo "::error::Pushed tag $VERSION does not resolve to checked-out commit $source_sha."
+              exit 1
+            fi
+            relation=$(gh api "repos/$GITHUB_REPOSITORY/compare/$source_sha...master" --jq '.status')
+            if [[ "$relation" != "ahead" && "$relation" != "identical" ]]; then
+              echo "::error::Pushed tag $VERSION is not in master history."
+              exit 1
+            fi
+          fi
+          # The replacement bypass is restricted to the validated release
+          # workflow and re-checks the tag/source relationship independently.
+          if [[ "$REPLACEMENT_INPUT" == "true" ]]; then
+            release_tag_pattern='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$'
+            if [[ "$EVENT_NAME_INPUT" != "workflow_dispatch" ||
+                  ! "$VERSION" =~ $release_tag_pattern ||
+                  -z "$SOURCE_REF_INPUT" ]]; then
+              echo "::error::Replacement requires workflow_dispatch, a valid release tag, and an explicit source_ref."
+              exit 1
+            fi
+
+            source_sha=$(git rev-parse HEAD)
+            tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION")
+            tag_type=$(jq -r '.object.type' <<< "$tag_json")
+            tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+            while [[ "$tag_type" == "tag" ]]; do
+              tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")
+              tag_type=$(jq -r '.object.type' <<< "$tag_json")
+              tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+            done
+            if [[ "$tag_type" != "commit" || "$tag_sha" != "$source_sha" ]]; then
+              echo "::error::Replacement tag $VERSION must point to tested source $source_sha."
+              exit 1
+            fi
+
+            relation=$(gh api "repos/$GITHUB_REPOSITORY/compare/$source_sha...master" --jq '.status')
+            if [[ "$relation" != "ahead" && "$relation" != "identical" ]]; then
+              echo "::error::Replacement source is not in master history."
+              exit 1
+            fi
+          fi
           TAGS="${DOCKER_IMAGE}:${VERSION}"
-          if [[ "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\-[0-9]{1,3}$ ]]; then
+          release_tag_pattern='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$'
+          if [[ "$VERSION" =~ $release_tag_pattern ]]; then
             REALEASE_TAG=true
+          fi
+
+          if [[ "$EVENT_NAME_INPUT" == "workflow_dispatch" && "$PUBLISH_INPUT" != "false" ]]; then
+            source_sha=$(git rev-parse HEAD)
+            if [[ "$TEST_ID_INPUT" == release-publish-* || "$VERSION" =~ $release_tag_pattern ]]; then
+              expected_prefix="release-publish-$VERSION-$source_sha-run-"
+              if [[ ! "$VERSION" =~ $release_tag_pattern || "$TEST_ID_INPUT" != "$expected_prefix"* ]]; then
+                echo "::error::Release publication test_id must match the actual image version and checked-out source SHA ($expected_prefix)."
+                exit 1
+              fi
+            fi
+          fi
+
+          # Check whether this source is still the current master before any
+          # publication can update latest, including direct master builds.
+          if [[ "$PUBLISH_INPUT" != "false" &&
+                ( "$VERSION" == "latest" || "$VERSION" =~ $release_tag_pattern ) ]]; then
+            source_sha=$(git rev-parse HEAD)
+            master_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/master" --jq '.object.sha')
+            if [[ "$source_sha" != "$master_sha" ]]; then
+              suppress_latest=true
+              echo "::notice::Source is not current master; leaving latest unchanged."
+            fi
+          fi
+
+          # Publication history and tag checks apply only to actual release
+          # publications. Test-only dispatches must not require an existing tag.
+          if [[ "$PUBLISH_INPUT" != "false" && "$VERSION" =~ $release_tag_pattern ]]; then
+            # Treat every prior publication attempt as potentially having pushed
+            # an image, even if the workflow later failed or was cancelled.
+            # Same-SHA retries are safe; a different SHA requires explicit approval.
+            if [[ "$EVENT_NAME_INPUT" == "push" && "$EVENT_REF_INPUT" == refs/tags/* ]]; then
+              bash .workflow-tools/.github/scripts/check-release-image-history.sh \
+                "repos/$GITHUB_REPOSITORY" "$VERSION" "$source_sha" \
+                "$replacement_effective" "$CURRENT_RUN_ID" "true"
+            fi
+
+            if [[ "$EVENT_NAME_INPUT" == "workflow_dispatch" ]]; then
+              tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION")
+              tag_type=$(jq -r '.object.type' <<< "$tag_json")
+              tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+              while [[ "$tag_type" == "tag" ]]; do
+                tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")
+                tag_type=$(jq -r '.object.type' <<< "$tag_json")
+                tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+              done
+              if [[ "$tag_type" != "commit" || "$tag_sha" != "$source_sha" ]]; then
+                echo "::error::Release tag $VERSION does not resolve to tested source $source_sha."
+                exit 1
+              fi
+
+              relation=$(gh api "repos/$GITHUB_REPOSITORY/compare/$source_sha...master" --jq '.status')
+              if [[ "$relation" != "ahead" && "$relation" != "identical" ]]; then
+                echo "::error::Release source is not in master history."
+                exit 1
+              fi
+
+              bash .workflow-tools/.github/scripts/check-release-image-history.sh \
+                "repos/$GITHUB_REPOSITORY" "$VERSION" "$source_sha" "$replacement_effective" "$CURRENT_RUN_ID"
+            fi
+          fi
+
+          # A stale master build must not push a direct :latest tag at all.
+          # Release-version tags remain publishable; only their latest promotion is suppressed.
+          if [[ "$VERSION" == "latest" && "$suppress_latest" == "true" ]]; then
+            TAGS=""
           fi
           TAGS_INT="$TAGS"
           TAGS=""
-          if [ "$DOCKERHUB_USERNAME" != '' ] && [ "$DOCKERHUB_TOKEN" != '' ]; then
-            if [ "$REALEASE_TAG" = "true" ]; then
-              TAGS="$TAGS_INT,${DOCKER_IMAGE}:latest"
-            else
+          if [[ -n "$TAGS_INT" ]]; then
+            if [ "$DOCKERHUB_USERNAME" != '' ] && [ "$DOCKERHUB_TOKEN" != '' ]; then
               TAGS="$TAGS_INT"
             fi
-          fi
-          if [ "$GITHUB_TOKEN" != '' ]; then
-            if [ "$REALEASE_TAG" = "true" ]; then
-              TAGS="$TAGS,ghcr.io/$TAGS_INT,ghcr.io/${DOCKER_IMAGE}:latest"
-            else
-              TAGS="$TAGS,ghcr.io/$TAGS_INT"
+            if [ "$GITHUB_TOKEN" != '' ]; then
+              if [[ -n "$TAGS" ]]; then
+                TAGS="$TAGS,ghcr.io/$TAGS_INT"
+              else
+                TAGS="ghcr.io/$TAGS_INT"
+              fi
+            fi
+            if [ "$QUAY_USERNAME" != '' ] && [ "$QUAY_TOKEN" != '' ]; then
+              if [[ -n "$TAGS" ]]; then
+                TAGS="$TAGS,quay.io/$TAGS_INT"
+              else
+                TAGS="quay.io/$TAGS_INT"
+              fi
             fi
           fi
-          if [ "$QUAY_USERNAME" != '' ] && [ "$QUAY_TOKEN" != '' ]; then
-            if [ "$REALEASE_TAG" = "true" ]; then
-              TAGS="$TAGS,quay.io/$TAGS_INT,quay.io/${DOCKER_IMAGE}:latest"
-            else
-              TAGS="$TAGS,quay.io/$TAGS_INT"
-            fi
+          latest_candidate=false
+          if [[ "$PUBLISH_INPUT" != "false" && "$REALEASE_TAG" == "true" &&
+                "$suppress_latest" != "true" && -n "$TAGS" ]]; then
+            latest_candidate=true
           fi
-          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-          echo "skip_publish=false" >> "$GITHUB_OUTPUT"
+          {
+            echo "tags=${TAGS}"
+            echo "latest_candidate=$latest_candidate"
+          } >> "$GITHUB_OUTPUT"
 
-          # Workflow-level concurrency serializes runs for this ref. A second
-          # run must also avoid publishing if an earlier run already succeeded.
-          if [[ "$PUBLISH_INPUT" != "false" && \
-                "$VERSION" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$ ]]; then
-            source_sha="${SOURCE_REF_INPUT:-$GITHUB_SHA}"
-            publish_title="Docker Image CI release-publish-$VERSION-$source_sha"
-            run_lines=$(gh api --paginate --method GET \
-              "repos/$GITHUB_REPOSITORY/actions/workflows/docker.image.yml/runs" \
-              -F per_page=100 \
-              --jq '.workflow_runs[] | {id,event,head_sha,head_branch,display_title,conclusion}')
-            successful=$(jq -s --arg sha "$source_sha" --arg tag "$VERSION" \
-              --arg title "$publish_title" --argjson current "$GITHUB_RUN_ID" '
-                [.[] | select(
-                  .id != $current
-                  and .conclusion == "success"
-                  and (
-                    ((.head_branch == $tag) and (.head_sha == $sha)
-                      and (.event == "push" or .event == "workflow_dispatch"))
-                    or .display_title == $title
-                  )
-                )] | length
-              ' <<< "$run_lines")
-            if [[ "$successful" -gt 0 ]]; then
-              echo "A successful image run already exists for $VERSION at $source_sha."
-              echo "skip_publish=true" >> "$GITHUB_OUTPUT"
-            fi
-          fi
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+      - name: Download validated multi-platform OCI image
+        uses: actions/download-artifact@v8
         with:
-          platforms: all
+          name: multiarch-${{ github.run_id }}
+          path: /tmp
+
+      - name: Install Skopeo
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes skopeo
 
       - name: Set up Docker Buildx
-        id: buildx
         uses: docker/setup-buildx-action@v4
-
-      - name: Cache Docker layers
-        uses: actions/cache@v6
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-
 
       - name: Login to ghcr
         env:
@@ -534,41 +831,92 @@ jobs:
           username: ${{ env.QUAY_USERNAME }}
           password: ${{ env.QUAY_TOKEN }}
 
-      - name: Test
-        id: docker_test
-        uses: docker/build-push-action@v7
-        with:
-          builder: ${{ steps.buildx.outputs.name }}
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
-          build-args: |
-            BUILD_DATE=${{ steps.metadata.outputs.build_date }}
-            BUILD_VERSION=${{ steps.metadata.outputs.build_version }}
-            VCS_REF=${{ steps.metadata.outputs.vcs_ref }}
-            VCS_URL=${{ steps.metadata.outputs.vcs_url }}
-            VCS_BRANCH=${{ steps.metadata.outputs.vcs_branch }}
-
+      # Keep this step name stable: release-history scripts use it to detect publication attempts.
       - name: Build and push
-        if: steps.prep.outputs.skip_publish != 'true'
         id: docker_build
-        uses: docker/build-push-action@v7
-        with:
-          builder: ${{ steps.buildx.outputs.name }}
-          context: .
-          file: ./Dockerfile
-          platforms: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64
-          push: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
-          tags: |
-            ${{ steps.prep.outputs.tags }}
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache
-          build-args: |
-            BUILD_DATE=${{ steps.metadata.outputs.build_date }}
-            BUILD_VERSION=${{ steps.metadata.outputs.build_version }}
-            VCS_REF=${{ steps.metadata.outputs.vcs_ref }}
-            VCS_URL=${{ steps.metadata.outputs.vcs_url }}
-            VCS_BRANCH=${{ steps.metadata.outputs.vcs_branch }}
+        if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish) && steps.prep.outputs.tags != '' }}
+        env:
+          OCI_ARCHIVE: /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.oci.tar
+          IMAGE_TAGS: ${{ steps.prep.outputs.tags }}
+        run: |
+          set -euo pipefail
+          archive_digest="sha256:$(skopeo inspect --raw "oci-archive:${OCI_ARCHIVE}:latest" | sha256sum | cut -d' ' -f1)"
+          while IFS= read -r image_tag; do
+            [[ -z "$image_tag" ]] && continue
+            if [[ "$image_tag" == ghcr.io/* || "$image_tag" == quay.io/* ]]; then
+              registry="${image_tag%%/*}"
+              repository="${image_tag#*/}"
+            else
+              registry=docker.io
+              repository="$image_tag"
+            fi
+            destination="docker://${registry}/${repository}"
+            echo "Publishing ${registry}/${repository} from tested OCI archive."
+            skopeo copy --authfile "$HOME/.docker/config.json" --all --preserve-digests \
+              "oci-archive:${OCI_ARCHIVE}:latest" "$destination"
+            remote_digest="sha256:$(skopeo inspect --authfile "$HOME/.docker/config.json" --raw "$destination" | sha256sum | cut -d' ' -f1)"
+            if [[ "$remote_digest" != "$archive_digest" ]]; then
+              echo "::error::Published digest mismatch for ${registry}/${repository}: expected $archive_digest, got $remote_digest."
+              exit 1
+            fi
+            echo "Verified ${registry}/${repository} at $remote_digest."
+          done < <(tr ',' '\n' <<< "$IMAGE_TAGS")
+          echo "digest=$archive_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the latest image tag
+        if: steps.prep.outputs.latest_candidate == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.image_version || github.ref_name }}
+          SOURCE_SHA: ${{ needs.test-build.outputs.tested_sha }}
+          IMAGE_DIGEST: ${{ steps.docker_build.outputs.digest }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
+        run: |
+          set -euo pipefail
+          release_tag_pattern='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$'
+          if [[ ! "$RELEASE_TAG" =~ $release_tag_pattern || -z "$SOURCE_SHA" || -z "$IMAGE_DIGEST" ]]; then
+            echo "::error::Invalid release tag or missing source SHA/image digest."
+            exit 1
+          fi
+
+          API="repos/$REPOSITORY"
+          # Different release versions may publish concurrently. Re-check master
+          # and publication history immediately before updating latest; a narrow
+          # race between those checks and the registry write remains possible.
+          master_sha=$(gh api "$API/git/ref/heads/master" --jq '.object.sha')
+          if [[ "$SOURCE_SHA" != "$master_sha" ]]; then
+            echo "::notice::Release source is no longer current master; leaving latest unchanged."
+            exit 0
+          fi
+
+          published_versions=$(bash .workflow-tools/.github/scripts/list-published-release-versions.sh "$API")
+          highest_prior=$(printf '%s\n' "$published_versions" | sort -V | tail -n1)
+          if [[ -n "$highest_prior" ]]; then
+            lowest=$(printf '%s\n%s\n' "$RELEASE_TAG" "$highest_prior" | sort -V | head -n1)
+            if [[ "$RELEASE_TAG" != "$highest_prior" && "$lowest" == "$RELEASE_TAG" ]]; then
+              echo "::notice::Release $RELEASE_TAG is older than $highest_prior; leaving latest unchanged."
+              exit 0
+            fi
+          fi
+
+          USER="$GITHUB_REPOSITORY_OWNER"
+          IMAGE_NAME="${REPOSITORY##*/}"
+          IMAGE_NAME="${IMAGE_NAME#docker-}"
+          DOCKER_IMAGE="$USER/$IMAGE_NAME"
+          if [[ -n "$DOCKERHUB_USERNAME" && -n "$DOCKERHUB_TOKEN" ]]; then
+            docker buildx imagetools create --tag "$DOCKER_IMAGE:latest" "$DOCKER_IMAGE@$IMAGE_DIGEST"
+          fi
+          if [[ -n "$GITHUB_TOKEN" ]]; then
+            docker buildx imagetools create --tag "ghcr.io/$DOCKER_IMAGE:latest" "ghcr.io/$DOCKER_IMAGE@$IMAGE_DIGEST"
+          fi
+          if [[ -n "$QUAY_USERNAME" && -n "$QUAY_TOKEN" ]]; then
+            docker buildx imagetools create --tag "quay.io/$DOCKER_IMAGE:latest" "quay.io/$DOCKER_IMAGE@$IMAGE_DIGEST"
+          fi
 
       - name: Image digest
         run: echo ${{ steps.docker_build.outputs.digest }}
