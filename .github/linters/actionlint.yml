@@ -1,0 +1,6 @@
+# actionlint 1.7.12 does not yet recognize GitHub Actions' concurrency.queue.
+# Keep the exception scoped to the release workflow and this single diagnostic.
+paths:
+  .github/workflows/docker.image.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'
