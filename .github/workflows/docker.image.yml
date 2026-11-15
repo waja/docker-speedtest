@@ -186,39 +186,35 @@ jobs:
             echo "vcs_branch=$vcs_branch"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-        with:
-          platforms: all
       - name: Set up Docker Buildx
         id: buildx
         uses: docker/setup-buildx-action@v4
         with:
           driver-opts: network=host
-      - name: Build multi-platform OCI image
+      - name: Build single-platform test image
         id: docker_build
         uses: docker/build-push-action@v7
         with:
           builder: ${{ steps.buildx.outputs.name }}
           push: false
-          outputs: type=oci,name=localhost:5000/foobar/${{ env.IMAGE_NAME }}:latest,dest=/tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.oci.tar
-          tags: localhost:5000/foobar/${{ env.IMAGE_NAME }}:latest
+          outputs: type=docker,dest=/tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.tar
+          tags: localhost:5000/foobar/${{ env.IMAGE_NAME }}
           cache-from: type=gha,scope=speedtest
           cache-to: type=gha,mode=max,scope=speedtest
           context: .
           file: ./Dockerfile
-          platforms: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64
+          platforms: linux/amd64
           build-args: |
             BUILD_DATE=${{ needs.shiftleft.outputs.build_date }}
             BUILD_VERSION=${{ steps.build_metadata.outputs.build_version }}
             VCS_REF=${{ steps.build_metadata.outputs.vcs_ref }}
             VCS_URL=${{ needs.shiftleft.outputs.vcs_url }}
             VCS_BRANCH=${{ steps.build_metadata.outputs.vcs_branch }}
-      - name: Upload OCI image artifact
+      - name: Upload single-platform test image
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.IMAGE_NAME }}-${{ github.run_id }}
-          path: /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.oci.tar
+          path: /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.tar
           if-no-files-found: error
           compression-level: 0
   test:
@@ -234,22 +230,15 @@ jobs:
         ports:
           - 5000:5000
     steps:
-      - name: Checkout workflow scripts
-        uses: actions/checkout@v7
-      - name: Download OCI image artifact
+      - name: Download single-platform test image
         uses: actions/download-artifact@v8
         with:
           name: ${{ env.IMAGE_NAME }}-${{ github.run_id }}
           path: /tmp
-      - name: Install Skopeo
+      - name: Load image into local registry
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes skopeo
-      - name: Load OCI image into local registry
-        env:
-          OCI_ARCHIVE: /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.oci.tar
-        run: |
-          bash .github/scripts/load-oci-image.sh "${{ env.IMAGE_NAME }}" "$OCI_ARCHIVE"
+          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.tar
+          docker push localhost:5000/foobar/${{ env.IMAGE_NAME }}
       - name: Inspect the Docker image
         run: |
           docker buildx imagetools inspect localhost:5000/foobar/${{ env.IMAGE_NAME }}
@@ -266,10 +255,68 @@ jobs:
             echo "ERROR: Expected 'speedtest-cli' but got '$TEST_STRING'"
             exit 1
           fi
+  release-build:
+    name: Build multi-platform release candidate
+    needs:
+      - test-build
+      - test
+      - dockle
+      - trivy
+      - anchore
+      - shiftleft
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tested source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.test-build.outputs.tested_sha }}
+          fetch-depth: 0
+      - name: Verify tested source
+        env:
+          EXPECTED_SHA: ${{ needs.test-build.outputs.tested_sha }}
+        run: |
+          set -euo pipefail
+          test -n "$EXPECTED_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: all
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: network=host
+      - name: Build multi-platform OCI release candidate
+        uses: docker/build-push-action@v7
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          push: false
+          outputs: type=oci,name=localhost:5000/foobar/${{ env.IMAGE_NAME }}:latest,dest=/tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.oci.tar
+          tags: localhost:5000/foobar/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha,scope=speedtest
+          cache-to: type=gha,mode=max,scope=speedtest
+          context: .
+          file: ./Dockerfile
+          platforms: linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64
+          build-args: |
+            BUILD_DATE=${{ needs.shiftleft.outputs.build_date }}
+            BUILD_VERSION=${{ needs.shiftleft.outputs.build_version }}
+            VCS_REF=${{ needs.shiftleft.outputs.vcs_ref }}
+            VCS_URL=${{ needs.shiftleft.outputs.vcs_url }}
+            VCS_BRANCH=${{ needs.shiftleft.outputs.vcs_branch }}
+      - name: Upload multi-platform OCI image
+        uses: actions/upload-artifact@v7
+        with:
+          name: multiarch-${{ github.run_id }}
+          path: /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.oci.tar
+          if-no-files-found: error
+          compression-level: 0
+
   platform-smoke:
     name: Smoke test ${{ matrix.platform }}
     needs:
-      - test-build
+      - release-build
     strategy:
       fail-fast: false
       matrix:
@@ -298,10 +345,10 @@ jobs:
     steps:
       - name: Checkout workflow scripts
         uses: actions/checkout@v7
-      - name: Download OCI image artifact
+      - name: Download multi-platform OCI image
         uses: actions/download-artifact@v8
         with:
-          name: ${{ env.IMAGE_NAME }}-${{ github.run_id }}
+          name: multiarch-${{ github.run_id }}
           path: /tmp
       - name: Install Skopeo
         run: |
@@ -354,22 +401,15 @@ jobs:
         ports:
           - 5000:5000
     steps:
-      - name: Checkout workflow scripts
-        uses: actions/checkout@v7
-      - name: Download OCI image artifact
+      - name: Download single-platform test image
         uses: actions/download-artifact@v8
         with:
           name: ${{ env.IMAGE_NAME }}-${{ github.run_id }}
           path: /tmp
-      - name: Install Skopeo
+      - name: Load image into local registry
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes skopeo
-      - name: Load OCI image into local registry
-        env:
-          OCI_ARCHIVE: /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.oci.tar
-        run: |
-          bash .github/scripts/load-oci-image.sh "${{ env.IMAGE_NAME }}" "$OCI_ARCHIVE"
+          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.tar
+          docker push localhost:5000/foobar/${{ env.IMAGE_NAME }}
       - name: Run dockle container image linter
         uses: goodwithtech/dockle-action@v0.4.15
         with:
@@ -397,22 +437,15 @@ jobs:
         ports:
           - 5000:5000
     steps:
-      - name: Checkout workflow scripts
-        uses: actions/checkout@v7
-      - name: Download OCI image artifact
+      - name: Download single-platform test image
         uses: actions/download-artifact@v8
         with:
           name: ${{ env.IMAGE_NAME }}-${{ github.run_id }}
           path: /tmp
-      - name: Install Skopeo
+      - name: Load image into local registry
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes skopeo
-      - name: Load OCI image into local registry
-        env:
-          OCI_ARCHIVE: /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.oci.tar
-        run: |
-          bash .github/scripts/load-oci-image.sh "${{ env.IMAGE_NAME }}" "$OCI_ARCHIVE"
+          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.tar
+          docker push localhost:5000/foobar/${{ env.IMAGE_NAME }}
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -438,22 +471,15 @@ jobs:
         ports:
           - 5000:5000
     steps:
-      - name: Checkout workflow scripts
-        uses: actions/checkout@v7
-      - name: Download OCI image artifact
+      - name: Download single-platform test image
         uses: actions/download-artifact@v8
         with:
           name: ${{ env.IMAGE_NAME }}-${{ github.run_id }}
           path: /tmp
-      - name: Install Skopeo
+      - name: Load image into local registry
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes skopeo
-      - name: Load OCI image into local registry
-        env:
-          OCI_ARCHIVE: /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.oci.tar
-        run: |
-          bash .github/scripts/load-oci-image.sh "${{ env.IMAGE_NAME }}" "$OCI_ARCHIVE"
+          docker load --input /tmp/${{ env.IMAGE_NAME }}-${{ github.run_id }}.tar
+          docker push localhost:5000/foobar/${{ env.IMAGE_NAME }}
       - name: Run the Anchore scan action itself with GitHub Advanced Security code scanning integration enabled
         uses: anchore/scan-action@v7.4.2
         with:
@@ -473,6 +499,7 @@ jobs:
     needs:
       - test-build
       - test
+      - release-build
       - platform-smoke
       - dockle
       - trivy
@@ -754,10 +781,10 @@ jobs:
             echo "latest_candidate=$latest_candidate"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Download tested OCI image artifact
+      - name: Download validated multi-platform OCI image
         uses: actions/download-artifact@v8
         with:
-          name: ${{ env.IMAGE_NAME }}-${{ github.run_id }}
+          name: multiarch-${{ github.run_id }}
           path: /tmp
 
       - name: Install Skopeo
