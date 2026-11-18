@@ -50,11 +50,11 @@ on:
       - master
     tags:
       - "*.*.*-*"
-  # Validate pull requests targeting development. Release PRs target master
-  # and are validated by the release workflow after the merge.
+  # Validate pull requests targeting both development and master.
   pull_request:
     branches:
       - development
+      - master
   schedule:
     - cron: "43 10 * * 4"
 
