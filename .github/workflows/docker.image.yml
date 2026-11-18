@@ -33,6 +33,16 @@ on:
         required: false
         type: boolean
         default: false
+      create_release_tag:
+        description: "Create or move the release tag after all validation jobs pass"
+        required: false
+        type: boolean
+        default: false
+      expected_tag_ref_sha:
+        description: "Expected existing tag ref SHA for an atomic replacement"
+        required: false
+        type: string
+        default: ""
   push:
     branches:
       - $default-branch
@@ -501,6 +511,10 @@ jobs:
           sarif_file: "sarif-reports"
   release-docker:
     name: Release Docker images
+    permissions:
+      actions: read
+      contents: write
+      packages: write
     needs:
       - test-build
       - test
@@ -576,6 +590,7 @@ jobs:
           EVENT_NAME_INPUT: ${{ github.event_name }}
           EVENT_REF_INPUT: ${{ github.ref }}
           EVENT_BEFORE_INPUT: ${{ github.event.before }}
+          CREATE_RELEASE_TAG_INPUT: ${{ inputs.create_release_tag }}
           QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
         run: |
@@ -665,17 +680,21 @@ jobs:
             fi
 
             source_sha=$(git rev-parse HEAD)
-            tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION")
-            tag_type=$(jq -r '.object.type' <<< "$tag_json")
-            tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
-            while [[ "$tag_type" == "tag" ]]; do
-              tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")
+            # When the release job creates or replaces the tag later, its
+            # current target is intentionally not required to match source yet.
+            if [[ "$CREATE_RELEASE_TAG_INPUT" != "true" ]]; then
+              tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION")
               tag_type=$(jq -r '.object.type' <<< "$tag_json")
               tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
-            done
-            if [[ "$tag_type" != "commit" || "$tag_sha" != "$source_sha" ]]; then
-              echo "::error::Replacement tag $VERSION must point to tested source $source_sha."
-              exit 1
+              while [[ "$tag_type" == "tag" ]]; do
+                tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")
+                tag_type=$(jq -r '.object.type' <<< "$tag_json")
+                tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+              done
+              if [[ "$tag_type" != "commit" || "$tag_sha" != "$source_sha" ]]; then
+                echo "::error::Replacement tag $VERSION must point to tested source $source_sha."
+                exit 1
+              fi
             fi
 
             relation=$(gh api "repos/$GITHUB_REPOSITORY/compare/$source_sha...master" --jq '.status')
@@ -726,23 +745,26 @@ jobs:
             fi
 
             if [[ "$EVENT_NAME_INPUT" == "workflow_dispatch" ]]; then
-              tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION")
-              tag_type=$(jq -r '.object.type' <<< "$tag_json")
-              tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
-              while [[ "$tag_type" == "tag" ]]; do
-                tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")
-                tag_type=$(jq -r '.object.type' <<< "$tag_json")
-                tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
-              done
-              if [[ "$tag_type" != "commit" || "$tag_sha" != "$source_sha" ]]; then
-                echo "::error::Release tag $VERSION does not resolve to tested source $source_sha."
-                exit 1
-              fi
+              if [[ "$CREATE_RELEASE_TAG_INPUT" != "true" ]]; then
+                  tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION")
+                  tag_type=$(jq -r '.object.type' <<< "$tag_json")
+                  tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+                  while [[ "$tag_type" == "tag" ]]; do
+                    tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")
+                    tag_type=$(jq -r '.object.type' <<< "$tag_json")
+                    tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+                  done
+                  if [[ "$tag_type" != "commit" || "$tag_sha" != "$source_sha" ]]; then
+                    echo "::error::Release tag $VERSION does not resolve to tested source $source_sha."
+                    exit 1
+                  fi
 
-              relation=$(gh api "repos/$GITHUB_REPOSITORY/compare/$source_sha...master" --jq '.status')
-              if [[ "$relation" != "ahead" && "$relation" != "identical" ]]; then
-                echo "::error::Release source is not in master history."
-                exit 1
+                  relation=$(gh api "repos/$GITHUB_REPOSITORY/compare/$source_sha...master" --jq '.status')
+                  if [[ "$relation" != "ahead" && "$relation" != "identical" ]]; then
+                    echo "::error::Release source is not in master history."
+                    exit 1
+                  fi
+
               fi
 
               bash .workflow-tools/.github/scripts/check-release-image-history.sh \
@@ -832,6 +854,159 @@ jobs:
           password: ${{ env.QUAY_TOKEN }}
 
       # Keep this step name stable: release-history scripts use it to detect publication attempts.
+      - name: Create or verify release tag after all validation jobs pass
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && inputs.create_release_tag }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_PUSH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.image_version }}
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
+          REPLACEMENT_INPUT: ${{ inputs.replacement }}
+          EXPECTED_TAG_REF_SHA: ${{ inputs.expected_tag_ref_sha }}
+          REPOSITORY: ${{ github.repository }}
+          TEST_ID_INPUT: ${{ inputs.test_id }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          tag_pattern='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$'
+          if [[ ! "$RELEASE_TAG" =~ $tag_pattern || -z "$SOURCE_REF_INPUT" ]]; then
+            echo "::error::Tag creation requires a valid release tag and explicit source_ref."
+            exit 1
+          fi
+          SOURCE_SHA=$(git rev-parse HEAD)
+          SOURCE_REF_BRANCH="$SOURCE_REF_INPUT"
+          if [[ "$SOURCE_REF_BRANCH" == refs/heads/* ]]; then
+            SOURCE_REF_BRANCH="${SOURCE_REF_BRANCH#refs/heads/}"
+          fi
+          if ! SOURCE_REF_SHA=$(git rev-parse --verify "${SOURCE_REF_INPUT}^{commit}" 2>/dev/null); then
+            if ! SOURCE_REF_SHA=$(git rev-parse --verify "refs/remotes/origin/${SOURCE_REF_BRANCH}^{commit}" 2>/dev/null); then
+              echo "::error::Could not resolve source_ref to a commit: $SOURCE_REF_INPUT"
+              exit 1
+            fi
+          fi
+          if [[ "$SOURCE_SHA" != "$SOURCE_REF_SHA" ]]; then
+            echo "::error::Checked-out source does not match source_ref ($SOURCE_REF_SHA)."
+            exit 1
+          fi
+
+          # Validate the release publication ID before any tag mutation. The
+          # later Prepare step performs the same check for publication setup.
+          expected_test_id_prefix="release-publish-$RELEASE_TAG-$SOURCE_SHA-run-"
+          if [[ "$TEST_ID_INPUT" != "$expected_test_id_prefix"* ||
+                "$TEST_ID_INPUT" == "$expected_test_id_prefix" ]]; then
+            echo "::error::Release publication test_id must start with $expected_test_id_prefix and include a run identifier."
+            exit 1
+          fi
+
+          relation=$(gh api "repos/$REPOSITORY/compare/$SOURCE_SHA...master" --jq '.status')
+          if [[ "$relation" != "ahead" && "$relation" != "identical" ]]; then
+            echo "::error::Release source is not in master history."
+            exit 1
+          fi
+
+          # Reject conflicting publication history before creating or moving
+          # the Git tag. This guard also protects direct workflow dispatches.
+          bash .workflow-tools/.github/scripts/check-release-image-history.sh \
+            "repos/$REPOSITORY" "$RELEASE_TAG" "$SOURCE_SHA" "$REPLACEMENT_INPUT" "$CURRENT_RUN_ID" "false"
+
+          tag_file=$(mktemp)
+          tag_error=$(mktemp)
+          if gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG" >"$tag_file" 2>"$tag_error"; then
+            tag_ref_sha=$(jq -r '.object.sha' < "$tag_file")
+            tag_type=$(jq -r '.object.type' < "$tag_file")
+            tag_commit_sha=$tag_ref_sha
+            while [[ "$tag_type" == "tag" ]]; do
+              tag_object=$(gh api "repos/$REPOSITORY/git/tags/$tag_commit_sha")
+              tag_type=$(jq -r '.object.type' <<< "$tag_object")
+              tag_commit_sha=$(jq -r '.object.sha' <<< "$tag_object")
+            done
+            if [[ "$tag_type" != "commit" ]]; then
+              echo "::error::Existing release tag does not resolve to a commit."
+              exit 1
+            fi
+            if [[ "$REPLACEMENT_INPUT" == "true" ]]; then
+              if [[ "$tag_commit_sha" == "$SOURCE_SHA" ]]; then
+                # A previous attempt may have moved the tag successfully but
+                # failed before publication. Treat that target state as complete.
+                echo "Release tag already points to tested commit $SOURCE_SHA."
+              else
+                if [[ -z "$EXPECTED_TAG_REF_SHA" || "$tag_ref_sha" != "$EXPECTED_TAG_REF_SHA" ]]; then
+                  echo "::error::Release tag changed since replacement was approved."
+                  exit 1
+                fi
+                auth=$(printf 'x-access-token:%s' "$TAG_PUSH_TOKEN" | base64 -w0)
+                git -c "http.extraheader=AUTHORIZATION: basic $auth" \
+                  push --force-with-lease="refs/tags/$RELEASE_TAG:$EXPECTED_TAG_REF_SHA" \
+                  origin "$SOURCE_SHA:refs/tags/$RELEASE_TAG"
+                echo "Moved $RELEASE_TAG to tested commit $SOURCE_SHA."
+              fi
+            elif [[ "$tag_commit_sha" == "$SOURCE_SHA" ]]; then
+              echo "Release tag already points to tested commit $SOURCE_SHA."
+            else
+              echo "::error::Release tag already exists at a different commit."
+              exit 1
+            fi
+          else
+            if [[ "$REPLACEMENT_INPUT" == "true" ]]; then
+              echo "::error::Cannot replace a tag that does not exist."
+              exit 1
+            fi
+            if ! grep -Eqi 'HTTP 404|status.?404' "$tag_error"; then
+              cat "$tag_error"
+              echo "::error::Could not safely determine whether the release tag exists."
+              exit 1
+            fi
+            if ! GH_TOKEN="$TAG_PUSH_TOKEN" gh api --method POST "repos/$REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$SOURCE_SHA"; then
+              echo "::error::Could not create the release tag."
+              exit 1
+            fi
+            echo "Created $RELEASE_TAG at tested commit $SOURCE_SHA."
+          fi
+
+          # Confirm the final ref resolves to the tested source after either
+          # creating or replacing the tag.
+          final_tag_json=$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")
+          final_tag_type=$(jq -r '.object.type' <<< "$final_tag_json")
+          final_tag_sha=$(jq -r '.object.sha' <<< "$final_tag_json")
+          while [[ "$final_tag_type" == "tag" ]]; do
+            final_tag_json=$(gh api "repos/$REPOSITORY/git/tags/$final_tag_sha")
+            final_tag_type=$(jq -r '.object.type' <<< "$final_tag_json")
+            final_tag_sha=$(jq -r '.object.sha' <<< "$final_tag_json")
+          done
+          if [[ "$final_tag_type" != "commit" || "$final_tag_sha" != "$SOURCE_SHA" ]]; then
+            echo "::error::Release tag $RELEASE_TAG does not resolve to tested source $SOURCE_SHA after mutation."
+            exit 1
+          fi
+
+      - name: Verify existing release tag immediately before publication
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && !inputs.create_release_tag && inputs.image_version != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.image_version }}
+        run: |
+          set -euo pipefail
+          tag_pattern='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}-[0-9]{1,3}$'
+          if [[ ! "$RELEASE_TAG" =~ $tag_pattern ]]; then
+            echo "Image version '$RELEASE_TAG' is not a release tag; skipping Git tag verification."
+            exit 0
+          fi
+          tag_json=$(gh api "repos/$REPOSITORY/git/ref/tags/$RELEASE_TAG")
+          tag_type=$(jq -r '.object.type' <<< "$tag_json")
+          tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+          while [[ "$tag_type" == "tag" ]]; do
+            tag_json=$(gh api "repos/$REPOSITORY/git/tags/$tag_sha")
+            tag_type=$(jq -r '.object.type' <<< "$tag_json")
+            tag_sha=$(jq -r '.object.sha' <<< "$tag_json")
+          done
+          tested_sha=$(git rev-parse HEAD)
+          if [[ "$tag_type" != "commit" || "$tag_sha" != "$tested_sha" ]]; then
+            echo "::error::Release tag $RELEASE_TAG does not resolve to tested source $tested_sha."
+            exit 1
+          fi
+          echo "Release tag $RELEASE_TAG still points to tested source $tested_sha."
+
       - name: Build and push
         id: docker_build
         if: ${{ github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.publish) && steps.prep.outputs.tags != '' }}
